@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+import requests
+import socket
+import ssl
+import concurrent.futures
+import argparse
+import sys
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+
+console = Console()
+
+class ErsecScanner:
+    def __init__(self, target):
+        self.target = target.replace("https://", "").replace("http://", "").strip("/")
+        self.ip = None
+
+    def resolve_ip(self):
+        try:
+            self.ip = socket.gethostbyname(self.target)
+            console.print(f"[bold green][+] Target resolved to IP:[/bold green] {self.ip}")
+        except socket.gaierror:
+            console.print(f"[bold red][!] Failed to resolve {self.target}. Check the domain.[/bold red]")
+            sys.exit(1)
+
+    def geo_ip_lookup(self):
+        console.print("\n[bold cyan]=== IP Geolocation & ASN ===[/bold cyan]")
+        try:
+            # Free, no-key endpoint
+            res = requests.get(f"http://ip-api.com/json/{self.ip}", timeout=5).json()
+            if res.get("status") == "success":
+                table = Table(show_header=False)
+                table.add_column("Key", style="bold yellow")
+                table.add_column("Value", style="bold white")
+                table.add_row("ISP / ASN", res.get("isp", "N/A"))
+                table.add_row("Organization", res.get("org", "N/A"))
+                table.add_row("Country", res.get("country", "N/A"))
+                table.add_row("City", res.get("city", "N/A"))
+                console.print(table)
+            else:
+                console.print("[red][!] Could not retrieve GeoIP data.[/red]")
+        except Exception as e:
+            console.print(f"[red][!] GeoIP Error: {e}[/red]")
+
+    def get_http_headers(self):
+        console.print("\n[bold cyan]=== HTTP Security Headers ===[/bold cyan]")
+        try:
+            res = requests.get(f"http://{self.target}", timeout=5)
+            headers = res.headers
+            
+            table = Table(title="Header Analysis")
+            table.add_column("Header", style="bold yellow")
+            table.add_column("Status/Value", style="bold white")
+            
+            # Check for standard security headers
+            sec_headers = ['Strict-Transport-Security', 'Content-Security-Policy', 'X-Frame-Options', 'X-Content-Type-Options', 'Server', 'X-Powered-By']
+            for h in sec_headers:
+                if h in headers:
+                    table.add_row(h, f"[green]{headers[h]}[/green]")
+                else:
+                    table.add_row(h, "[red]Missing[/red]")
+            console.print(table)
+        except requests.exceptions.RequestException:
+            console.print("[red][!] Could not connect to target via HTTP.[/red]")
+
+    def get_ssl_cert(self):
+        console.print("\n[bold cyan]=== SSL/TLS Certificate Info ===[/bold cyan]")
+        try:
+            ctx = ssl.create_default_context()
+            with ctx.wrap_socket(socket.socket(), server_hostname=self.target) as s:
+                s.settimeout(5.0)
+                s.connect((self.target, 443))
+                cert = s.getpeercert()
+                
+                issuer = dict(x[0] for x in cert['issuer'])
+                issued_by = issuer.get('commonName', 'Unknown')
+                expires = cert['notAfter']
+                
+                console.print(f"[bold yellow]Issuer:[/bold yellow] {issued_by}")
+                console.print(f"[bold yellow]Expires:[/bold yellow] {expires}")
+                
+                # Get Subject Alternative Names (SANs) to find hidden subdomains
+                if 'subjectAltName' in cert:
+                    sans = [x[1] for x in cert['subjectAltName']]
+                    console.print(f"[bold yellow]SANs (Subdomains):[/bold yellow] {', '.join(sans[:5])}{'...' if len(sans) > 5 else ''}")
+        except Exception as e:
+            console.print(f"[red][!] SSL Error or port 443 closed: {e}[/red]")
+
+    def enumerate_subdomains(self):
+        console.print("\n[bold cyan]=== Subdomain Enumeration (via crt.sh) ===[/bold cyan]")
+        try:
+            # Using crt.sh free endpoint for certificate transparency logs
+            url = f"https://crt.sh/?q=%25.{self.target}&output=json"
+            res = requests.get(url, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                subdomains = set([entry['name_value'].lower() for entry in data])
+                
+                # Filter out wildcards and clean up
+                clean_subs = {sub for sub in subdomains if not sub.startswith('*')}
+                for sub in list(clean_subs)[:15]: # Show up to 15
+                    console.print(f"[green][+][/green] {sub}")
+                
+                if len(clean_subs) > 15:
+                    console.print(f"[yellow]... and {len(clean_subs) - 15} more subdomains found.[/yellow]")
+            else:
+                console.print("[red][!] crt.sh did not return a valid response.[/red]")
+        except Exception as e:
+            console.print(f"[red][!] Subdomain enumeration failed: {e}[/red]")
+
+    def get_wayback_history(self):
+        console.print("\n[bold cyan]=== Archive.org History ===[/bold cyan]")
+        try:
+            url = f"http://web.archive.org/cdx/search/cdx?url={self.target}&output=json&limit=1"
+            res = requests.get(url, timeout=5).json()
+            if len(res) > 1:
+                first_seen = res[1][1]
+                year, month, day = first_seen[:4], first_seen[4:6], first_seen[6:8]
+                console.print(f"[bold yellow]First Archived Snapshot:[/bold yellow] {year}-{month}-{day}")
+            else:
+                console.print("[yellow][!] No history found in the Wayback Machine.[/yellow]")
+        except Exception:
+            console.print("[red][!] Failed to connect to Archive.org[/red]")
+
+    def scan_ports(self):
+        console.print("\n[bold cyan]=== Rapid Port Scan ===[/bold cyan]")
+        # Top 20 most common/critical ports to keep it fast
+        common_ports = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995, 1723, 3306, 3389, 5900, 8080]
+        open_ports = []
+
+        def check_port(port):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            result = sock.connect_ex((self.ip, port))
+            sock.close()
+            if result == 0:
+                return port
+            return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            results = executor.map(check_port, common_ports)
+            for port in results:
+                if port:
+                    open_ports.append(port)
+                    console.print(f"[green][+] Port {port} is OPEN[/green]")
+        
+        if not open_ports:
+            console.print("[yellow][!] No common ports appear to be open (or they are filtered).[/yellow]")
+
+    def run(self):
+        console.print(Panel.fit(f"[bold red]ERSEC v2.0 - MAXIMUM RECON[/bold red]\nTarget: {self.target}", border_style="red"))
+        self.resolve_ip()
+        self.geo_ip_lookup()
+        self.get_http_headers()
+        self.get_ssl_cert()
+        self.enumerate_subdomains()
+        self.get_wayback_history()
+        self.scan_ports()
+        console.print("\n[bold green][+] ERSEC Scan Complete![/bold green]\n")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="ERSEC - Zero-Key OSINT & Recon Scanner")
+    parser.add_argument("command", choices=["scan"], help="Command to run (e.g., scan)")
+    parser.add_argument("target", help="Target domain (e.g., target.com)")
+    args = parser.parse_args()
+
+    if args.command == "scan":
+        scanner = ErsecScanner(args.target)
+        scanner.run()

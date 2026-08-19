@@ -1,0 +1,8 @@
+Package: ersec
+Version: 1.0
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3, python3-requests, python3-rich
+Maintainer: Developer <dev@ersec.local>
+Description: Zero-Key OSINT and Recon Scanner
