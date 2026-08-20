@@ -9,7 +9,6 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
-from rich.tree import Tree
 
 console = Console()
 
@@ -88,59 +87,64 @@ class ErsecEngine:
                     open_services.append(res)
                     if res["port"] in [21, 3306, 3389, 6379]:
                         self.risk_score += 2.5
-                        self.risk_factors.append(f"High-Risk Exposed Port/Service: {res['service']} ({res['port']})")
+                        self.risk_factors.append(f"High-Risk Exposed Port: {res['service']} ({res['port']})")
                     else:
                         self.risk_score += 0.5
 
         self.data["ports"] = open_services
 
-    def generate_mitre_and_attack_vectors(self):
-        """Generates MITRE ATT&CK mapping and simulated red-team operational vectors if score > 4.0."""
+    def generate_advanced_simulation_vectors(self):
+        """Generates advanced MITRE-aligned attack vectors if risk score > 4.0 under strict operator responsibility."""
         vectors = []
         score = min(self.risk_score, 10.0)
         
         if score >= 4.0:
             vectors.append({
-                "category": "Vector 1: External Remote Services & Initial Access",
-                "mitre": "MITRE ATT&CK T1190 (Exploit Public-Facing Application) / T1078 (Valid Accounts)",
-                "simulation": "If database or remote management ports (e.g., MySQL/RDP) are exposed, simulate credential stuffing or brute-force tests via authorized tooling (e.g., Hydra/Nmap NSE scripts) to test password complexity and account lockout policies."
+                "category": "Vector 1: Application & Public-Facing Exploitation",
+                "mitre": "MITRE ATT&CK T1190 (Exploit Public-Facing Application)",
+                "action": "Perform controlled vulnerability probing or exploit framework evaluations against identified database/service ports to test authentication robustness and input sanitization."
             })
             vectors.append({
-                "category": "Vector 2: Application Layer & Client-Side Interception",
-                "mitre": "MITRE ATT&CK T1557 (Adversary-in-the-Middle) / T1040 (Network Sniffing)",
-                "simulation": "Due to missing security headers (HSTS/CSP), evaluate HTTP traffic interception or session hijacking resilience using proxy tools under an approved scope agreement."
+                "category": "Vector 2: Volumetric Stress & Service Resilience",
+                "mitre": "MITRE ATT&CK T1498 (Network Denial of Service / Stress Testing)",
+                "action": "Execute authorized high-concurrency request benchmarking or SYN/HTTP flood resilience testing to measure edge rate-limiting thresholds and load balancer degradation points."
             })
             vectors.append({
-                "category": "Vector 3: Infrastructure Stress & Volumetric Resilience",
-                "mitre": "MITRE ATT&CK T1498 (Network Denial of Service)",
-                "simulation": "Test edge firewall rate-limiting and SYN-flood protection tolerances by conducting controlled, authorized load evaluations (e.g., using distributed benchmarking or compliance verification utilities)."
+                "category": "Vector 3: Credential Access & Brute-Force Simulation",
+                "mitre": "MITRE ATT&CK T1110 (Brute Force / Credential Stuffing)",
+                "action": "Simulate automated dictionary attacks against exposed remote administration services (e.g., SSH/RDP/MySQL) to audit lockout policies and password complexity enforcement."
             })
         return vectors
 
-    def query_groq_executive_ai(self):
-        api_key = os.getenv("GROQ_API_KEY")
+    def query_ai_engine(self):
+        """Robust multi-model fallback API client labeled cleanly as AI."""
+        api_key = os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY")
         if not api_key:
-            return "[yellow]GROQ_API_KEY not found. Skipping generative AI threat matrix.[/yellow]"
+            return "[yellow]API key environment variable not detected. Skipping generative AI threat matrix.[/yellow]"
 
-        models_to_try = [
+        # Up-to-date models list with automatic error fallbacks
+        candidate_models = [
+            "openai/gpt-oss-120b",
             "llama-3.3-70b-versatile",
-            "llama-3.1-70b-versatile",
-            "llama3-70b-8192",
-            "mixtral-8x7b-32768"
+            "qwen/qwen3.6-27b",
+            "llama-3.1-8b-instant"
         ]
 
         prompt = f"""
-        Target: {self.target}
+        Target Scope: {self.target}
         Calculated Risk Score: {self.risk_score}/10
-        Risk Factors: {json.dumps(self.risk_factors)}
-        Open Ports: {json.dumps(self.data.get('ports', []))}
+        Identified Risk Factors: {json.dumps(self.risk_factors)}
+        Open Ports Found: {json.dumps(self.data.get('ports', []))}
 
-        Act as an elite Red Team CISO. Provide:
-        1. Concise Attack Surface Assessment.
+        Act as an elite CISO Red Team Analyst. Provide:
+        1. Executive Threat Assessment (2 sentences).
+        2. Primary Exploit Chain Pathway.
+        3. Strategic Remediation Recommendation.
         """
 
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        for model in models_to_try:
+        
+        for model in candidate_models:
             try:
                 res = requests.post(
                     "https://api.groq.com/openai/v1/chat/completions",
@@ -149,48 +153,48 @@ class ErsecEngine:
                     timeout=8
                 )
                 if res.status_code == 200:
-                    return f"[bold green]AI Engine Active ({model})[/bold green]\n\n" + res.json()['choices'][0]['message']['content']
+                    return res.json()['choices'][0]['message']['content']
             except Exception:
                 continue
-        return "[red]Groq models unreachable or rate-limited.[/red]"
+
+        return "[red]All AI endpoints currently unreachable or rate-limited. Proceeding with static analysis engine.[/red]"
 
     def run_all(self):
         console.print(Panel.fit(
-            f"[bold white style=on red] ERSEC v5.0 — PROFESSIONAL RED TEAM & THREAT PLATFORM [/]\n"
-            f"[bold cyan]Target Scope:[/] {self.target}",
+            f"[bold white style=on red] ERSEC v6.0 — PROFESSIONAL ENTERPRISE SECURITY PLATFORM [/]\n"
+            f"[bold cyan]Target Domain:[/] {self.target}",
             border_style="red"
         ))
 
         self.resolve_dns()
 
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
-            progress.add_task(description="Executing Advanced Reconnaissance & Telemetry...", total=None)
+            progress.add_task(description="Executing Deep Telemetry & Attack Surface Audit...", total=None)
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 executor.submit(self.fetch_geoip)
                 executor.submit(self.audit_http_headers)
                 executor.submit(self.scan_ports)
 
-
         final_score = round(min(self.risk_score, 10.0), 1)
         score_color = "red" if final_score >= 4.0 else "green"
         console.print(Panel(f"ATTACK SURFACE RISK SCORE: {final_score} / 10.0", border_style=score_color))
 
-        # Conditional Ethical Red-Team Assessment Vectors (Triggered if score >= 4.0)
+        # Ethical Red-Team Module (Triggered if score >= 4.0)
         if final_score >= 4.0:
-            vectors = self.generate_mitre_and_attack_vectors()
-            table_vec = Table(title="[bold red]Authorized Red-Team Simulation Vectors (MITRE ATT&CK Aligned)[/bold red]", expand=True)
-            table_vec.add_column("Vector / Focus Area", style="cyan", width=25)
+            vectors = self.generate_advanced_simulation_vectors()
+            table_vec = Table(title="[bold red]Authorized Adversary Simulation Vectors (MITRE ATT&CK Aligned)[/bold red]", expand=True)
+            table_vec.add_column("Simulation Category", style="cyan", width=25)
             table_vec.add_column("MITRE Mapping", style="yellow", width=25)
-            table_vec.add_column("Controlled Assessment Procedure (Operator Discretion)", style="white")
+            table_vec.add_column("Operator Action Specification", style="white")
 
             for v in vectors:
-                table_vec.add_row(v["category"], v["mitre"], v["simulation"])
+                table_vec.add_row(v["category"], v["mitre"], v["action"])
             console.print(table_vec)
-            console.print("[dim]Notice: These pathways are provided exclusively for authorized penetration testing and defensive validation under explicit user responsibility.[/dim]\n")
+            console.print("[bold yellow]DISCLAIMER:[/bold yellow] [dim]Execution of these simulation vectors is restricted exclusively to authorized systems under explicit written consent. 100% legal and operational liability rests solely upon the system operator.[/dim]\n")
 
-        # Groq AI Intelligence
-        ai_output = self.query_groq_executive_ai()
-        console.print(Panel(ai_output, title="[bold cyan]Groq CISO Threat Intelligence[/bold cyan]", border_style="cyan"))
+        # Clean AI Intelligence Output
+        ai_output = self.query_ai_engine()
+        console.print(Panel(ai_output, title="[bold cyan]AI Executive Threat Intelligence Analysis[/bold cyan]", border_style="cyan"))
 
 if __name__ == "__main__":
     if len(sys.argv) < 3 or sys.argv[1] != "scan":
