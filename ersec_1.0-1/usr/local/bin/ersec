@@ -94,7 +94,7 @@ class ErsecEngine:
         self.data["ports"] = open_services
 
     def generate_ethical_hacking_vectors(self):
-        """Generates advanced MITRE-aligned adversary simulation vectors if risk score > 4.0."""
+        """Generates advanced MITRE-aligned adversary simulation vectors if risk score >= 4.0."""
         vectors = []
         score = min(self.risk_score, 10.0)
         
@@ -117,15 +117,16 @@ class ErsecEngine:
         return vectors
 
     def query_ai_engine(self):
-        """Universal AI client with rock-solid model fallback routing."""
+        """Universal AI client with updated 2026 production endpoints."""
         api_key = os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY")
         if not api_key:
             return "[yellow]API key environment variable not detected. Skipping AI executive assessment.[/yellow]"
 
+        # Updated current model IDs
         candidate_models = [
-            "llama-3.1-8b-instant",
-            "llama-3.3-70b-versatile",
-            "mixtral-8x7b-32768"
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "qwen/qwen3-32b"
         ]
 
         prompt = f"""
@@ -159,7 +160,7 @@ class ErsecEngine:
 
     def run_all(self):
         console.print(Panel.fit(
-            f"[bold white style=on red] ERSEC v7.0 — PROFESSIONAL ENTERPRISE SECURITY PLATFORM [/]\n"
+            f"[bold white style=on red] ERSEC v8.0 — PROFESSIONAL ENTERPRISE SECURITY PLATFORM [/]\n"
             f"[bold cyan]Target Scope:[/] {self.target}",
             border_style="red"
         ))
