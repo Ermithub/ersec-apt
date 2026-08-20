@@ -1,203 +1,684 @@
 #!/usr/bin/env python3
+"""
+ersec - Enterprise Security Recon & Evaluation CLI
+Path requested: ersec_1.0-1/usr/local/bin/ersec
+
+Corrected version: added missing imports, JSON decode handling, and explicit socket exception handling.
+"""
+
+from __future__ import annotations
+import argparse
 import concurrent.futures
 import json
+import logging
 import os
 import socket
 import sys
+import time
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Tuple
+
+import ipaddress
 import requests
+from requests.exceptions import RequestException
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.table import Table
+from rich.text import Text
+
+# Suppress insecure request warnings when verify=False is used in requests (kept intentionally for some legacy scans).
+urllib3.disable_warnings(InsecureRequestWarning)
+
+# Configure logging
+logging.basicConfig(
+    level=os.getenv("ERSEC_LOGLEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("ersec")
+
+# Constants
+CRITICAL_PORTS = {
+    "FTP": 21,
+    "SSH": 22,
+    "HTTP": 80,
+    "HTTPS": 443,
+    "MySQL": 3306,
+    "RDP": 3389,
+    "Redis": 6379,
+}
+
+AI_MODEL_FALLBACKS = [
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3-32b",
+]
+
+IP_API_URL = "http://ip-api.com/json/{ip}?fields=status,message,country,regionName,city,isp,org,query,as,lat,lon,timezone"
 
 console = Console()
 
-class ErsecEngine:
-    def __init__(self, target):
-        self.target = target.replace("https://", "").replace("http://", "").strip("/")
-        self.ip = None
-        self.ips = []
-        self.risk_score = 0.0
-        self.risk_factors = []
-        self.data = {}
+@dataclass
+class GeoIP:
+    status: str
+    message: Optional[str]
+    country: Optional[str]
+    region: Optional[str]
+    city: Optional[str]
+    isp: Optional[str]
+    org: Optional[str]
+    query: Optional[str]
+    as_info: Optional[str]
+    lat: Optional[float]
+    lon: Optional[float]
+    timezone: Optional[str]
 
-    def resolve_dns(self):
-        try:
-            _, _, ips = socket.gethostbyname_ex(self.target)
-            self.ips = ips
-            self.ip = ips[0]
-            self.data["ips"] = ips
-        except Exception as e:
-            console.print(f"[bold red][!] DNS Resolution failed for {self.target}: {e}[/bold red]")
-            sys.exit(1)
+@dataclass
+class TargetResult:
+    target: str
+    resolved_ips: List[str]
+    geoip: Dict[str, GeoIP]  # ip -> GeoIP
+    open_ports: Dict[str, int]  # service -> port (only open ones)
+    header_issues: Dict[str, Optional[str]]  # header -> reason or None
+    risk_score: float
+    ai_insight: Optional[str] = None
 
-    def fetch_geoip(self):
+def is_ip_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+def resolve_dns(target: str, timeout: float = 3.0) -> List[str]:
+    """
+    Resolve a hostname to IP addresses. If input is an IP (v4 or v6), return it as-is.
+    Explicitly handles socket.gaierror and related socket exceptions.
+    """
+    # If input is IP already (v4 or v6)
+    if is_ip_address(target):
+        return [target]
+
+    try:
+        infos = socket.getaddrinfo(target, None)
+        ips = sorted({item[4][0] for item in infos})
+        logger.debug("Resolved %s -> %s", target, ips)
+        return ips
+    except socket.gaierror as e:
+        logger.debug("DNS resolution failed for %s (gaierror): %s", target, e)
+        return []
+    except OSError as e:
+        logger.debug("DNS resolution failed for %s (OSError): %s", target, e)
+        return []
+    except Exception as e:
+        logger.debug("Unexpected DNS resolution error for %s: %s", target, e)
+        return []
+
+def geoip_lookup(ip: str, timeout: float = 4.0) -> Optional[GeoIP]:
+    """
+    Lookup geolocation and ASN info using ip-api.com
+    Handles JSON decode errors explicitly and returns a GeoIP with status indicating failure.
+    """
+    try:
+        url = IP_API_URL.format(ip=ip)
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
         try:
-            res = requests.get(f"http://ip-api.com/json/{self.ip}?fields=status,country,regionName,city,isp,org,as,query", timeout=5).json()
-            self.data["geoip"] = res if res.get("status") == "success" else None
+            data = r.json()
+        except ValueError as e:
+            logger.debug("GeoIP JSON decode error for %s: %s", ip, e)
+            return GeoIP(status="error", message="invalid-json", country=None, region=None, city=None, isp=None, org=None, query=ip, as_info=None, lat=None, lon=None, timezone=None)
+
+        if data.get("status") != "success":
+            return GeoIP(
+                status=data.get("status", "fail"),
+                message=data.get("message"),
+                country=None, region=None, city=None, isp=None, org=None,
+                query=ip, as_info=None, lat=None, lon=None, timezone=None,
+            )
+        return GeoIP(
+            status="success",
+            message=None,
+            country=data.get("country"),
+            region=data.get("regionName"),
+            city=data.get("city"),
+            isp=data.get("isp"),
+            org=data.get("org"),
+            query=data.get("query"),
+            as_info=data.get("as"),
+            lat=data.get("lat"),
+            lon=data.get("lon"),
+            timezone=data.get("timezone"),
+        )
+    except RequestException as e:
+        logger.debug("GeoIP request failed for %s: %s", ip, e)
+        return GeoIP(status="error", message=str(e), country=None, region=None, city=None, isp=None, org=None, query=ip, as_info=None, lat=None, lon=None, timezone=None)
+    except Exception as e:
+        logger.debug("Unexpected geoip error for %s: %s", ip, e)
+        return GeoIP(status="error", message=str(e), country=None, region=None, city=None, isp=None, org=None, query=ip, as_info=None, lat=None, lon=None, timezone=None)
+
+def audit_http_headers(host: str, port: int, timeout: float = 5.0) -> Dict[str, Optional[str]]:
+    """
+    Fetch headers for host and indicate missing or risky header reasons.
+    Returns a dict of header -> reason (None if present and OK).
+    """
+    result: Dict[str, Optional[str]] = {
+        "Strict-Transport-Security": "missing",
+        "Content-Security-Policy": "missing",
+        "X-Frame-Options": "missing",
+    }
+
+    scheme = "https" if port == 443 else "http"
+    url = f"{scheme}://{host}"
+    # Include non-standard port in URL
+    if port not in (80, 443):
+        url = f"{scheme}://{host}:{port}"
+
+    try:
+        # HEAD first, fallback to GET if HEAD yields no headers
+        r = requests.head(url, timeout=timeout, allow_redirects=True, verify=False)
+        headers = r.headers or {}
+        if not headers or r.status_code >= 400:
+            r = requests.get(url, timeout=timeout, allow_redirects=True, verify=False)
+            headers = r.headers or {}
+    except RequestException as e:
+        logger.debug("HTTP header audit request failed for %s: %s", url, e)
+        result["Strict-Transport-Security"] = f"request-failed: {e}"
+        result["Content-Security-Policy"] = f"request-failed: {e}"
+        result["X-Frame-Options"] = f"request-failed: {e}"
+        return result
+    except Exception as e:
+        logger.debug("Unexpected HTTP audit error for %s: %s", url, e)
+        result["Strict-Transport-Security"] = f"request-failed: {e}"
+        result["Content-Security-Policy"] = f"request-failed: {e}"
+        result["X-Frame-Options"] = f"request-failed: {e}"
+        return result
+
+    # HSTS
+    hsts = headers.get("Strict-Transport-Security")
+    if hsts:
+        h_low = hsts.lower()
+        if "max-age" in h_low and "includesubdomains" in h_low:
+            result["Strict-Transport-Security"] = None
+        elif "max-age" in h_low:
+            result["Strict-Transport-Security"] = "present-but-missing-includeSubDomains"
+        else:
+            result["Strict-Transport-Security"] = "present-but-unrecognized-format"
+
+    # CSP
+    csp = headers.get("Content-Security-Policy")
+    if csp:
+        csp_low = csp.lower()
+        if "default-src" in csp_low or "script-src" in csp_low:
+            result["Content-Security-Policy"] = None
+        else:
+            result["Content-Security-Policy"] = "present-but-likely-incomplete"
+
+    # X-Frame-Options
+    xfo = headers.get("X-Frame-Options")
+    if xfo:
+        low = xfo.lower()
+        if any(tok in low for tok in ("deny", "sameorigin")):
+            result["X-Frame-Options"] = None
+        else:
+            result["X-Frame-Options"] = "present-but-weak"
+
+    return result
+
+def scan_port(ip: str, port: int, timeout: float = 2.0) -> bool:
+    """
+    Attempt to open a TCP connection to ip:port. Return True if open.
+    Explicitly handles socket timeouts and OSError.
+    """
+    try:
+        # socket.create_connection raises socket.timeout or OSError/ConnectionRefusedError
+        conn = socket.create_connection((ip, port), timeout=timeout)
+        try:
+            conn.close()
         except Exception:
-            self.data["geoip"] = None
+            pass
+        logger.debug("Port open %s:%s", ip, port)
+        return True
+    except (socket.timeout, TimeoutError) as e:
+        logger.debug("Port scan timeout %s:%s - %s", ip, port, e)
+        return False
+    except (ConnectionRefusedError, OSError) as e:
+        # Closed or unreachable
+        logger.debug("Port closed/unreachable %s:%s - %s", ip, port, e)
+        return False
+    except Exception as e:
+        logger.debug("Unexpected error scanning %s:%s - %s", ip, port, e)
+        return False
 
-    def audit_http_headers(self):
-        headers_info = {"present": {}, "missing": []}
-        try:
-            res = requests.get(f"http://{self.target}", timeout=6, allow_redirects=True)
-            headers = res.headers
-            sec_headers = {
-                "Strict-Transport-Security": "HSTS Enforced",
-                "Content-Security-Policy": "CSP Configured",
-                "X-Frame-Options": "Clickjacking Protection",
-                "X-Content-Type-Options": "MIME Sniffing Protection"
-            }
-            for header, label in sec_headers.items():
-                if header in headers:
-                    headers_info["present"][label] = headers[header][:30]
-                else:
-                    headers_info["missing"].append(label)
-                    self.risk_score += 0.6
-                    self.risk_factors.append(f"Missing Header: {header}")
-            self.data["http"] = headers_info
-        except Exception:
-            self.data["http"] = None
+def calculate_risk_score(open_ports: Dict[str, int], header_issues: Dict[str, Optional[str]], geoip: Dict[str, GeoIP]) -> float:
+    """
+    Calculate a 0.0 - 10.0 risk score. Weighted combination of open critical ports and missing headers and geoip anomalies.
+    """
+    score = 0.0
+    port_weights = {
+        "FTP": 1.0,
+        "SSH": 1.6,
+        "HTTP": 0.6,
+        "HTTPS": 0.3,
+        "MySQL": 1.8,
+        "RDP": 2.0,
+        "Redis": 1.5,
+    }
+    for svc in open_ports:
+        w = port_weights.get(svc, 0.5)
+        score += w
 
-    def scan_ports(self):
-        critical_ports = {
-            21: "FTP", 22: "SSH", 80: "HTTP", 443: "HTTPS", 
-            3306: "MySQL", 3389: "RDP", 6379: "Redis", 8080: "HTTP-Alt"
-        }
-        open_services = []
+    header_weights = {
+        "Strict-Transport-Security": 1.2,
+        "Content-Security-Policy": 1.6,
+        "X-Frame-Options": 0.6,
+    }
+    for hdr, reason in header_issues.items():
+        if reason is None:
+            continue
+        if isinstance(reason, str) and reason.startswith("request-failed"):
+            score += header_weights.get(hdr, 0.5) * 0.7
+        else:
+            score += header_weights.get(hdr, 0.5)
 
-        def probe(port, name):
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1.0)
-                if sock.connect_ex((self.ip, port)) == 0:
-                    sock.close()
-                    return {"port": port, "service": name}
-                sock.close()
-            except Exception:
-                pass
-            return None
+    for ip, g in geoip.items():
+        if not g or g.status != "success":
+            score += 0.3
+            continue
+        if g.country and g.country.lower() not in ("united states", "united kingdom", "canada", "germany", "france"):
+            score += 0.6
+        as_info = (g.as_info or "").lower()
+        if any(k in as_info for k in ("cloud", "amazon", "google", "microsoft", "ovh", "digitalocean", "linode")):
+            score += 0.4
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [executor.submit(probe, p, s) for p, s in critical_ports.items()]
-            for f in concurrent.futures.as_completed(futures):
-                res = f.result()
-                if res:
-                    open_services.append(res)
-                    if res["port"] in [21, 3306, 3389, 6379]:
-                        self.risk_score += 2.5
-                        self.risk_factors.append(f"High-Risk Exposed Port: {res['service']} ({res['port']})")
-                    else:
-                        self.risk_score += 0.5
+    score = max(0.0, min(score, 10.0))
+    return round(score, 2)
 
-        self.data["ports"] = open_services
+class AIClient:
+    """
+    Minimal robust AI client using requests with model fallbacks.
+    Attempts multiple endpoints and handles JSON parse errors gracefully.
+    """
 
-    def generate_ethical_hacking_vectors(self):
-        """Generates advanced MITRE-aligned adversary simulation vectors if risk score >= 4.0."""
-        vectors = []
-        score = min(self.risk_score, 10.0)
-        
-        if score >= 4.0:
-            vectors.append({
-                "category": "Vector 1: Application Layer & Vulnerability Probing",
-                "mitre": "MITRE ATT&CK T1190 (Exploit Public-Facing Application)",
-                "action": "Conduct authorized vulnerability assessments or protocol fuzzing against exposed service ports to verify input sanitization and patch levels."
-            })
-            vectors.append({
-                "category": "Vector 2: Volumetric Load & Denial-of-Service Resilience",
-                "mitre": "MITRE ATT&CK T1498 (Network Denial of Service / Stress Simulation)",
-                "action": "Execute controlled concurrency benchmarking and edge rate-limiting validation tests to measure resilience against volumetric saturation."
-            })
-            vectors.append({
-                "category": "Vector 3: Credential Access & Brute-Force Testing",
-                "mitre": "MITRE ATT&CK T1110 (Brute Force / Credential Stuffing)",
-                "action": "Simulate automated login/dictionary evaluations against active authentication interfaces to verify account lockout enforcement and password complexity."
-            })
-        return vectors
+    def __init__(self, base_url: str, api_key: Optional[str], models: List[str] = None, timeout: float = 15.0):
+        self.base_url = base_url.rstrip("/") if base_url else ""
+        self.api_key = api_key or os.getenv("AI_API_KEY") or os.getenv("OPENAI_API_KEY")
+        self.models = models or AI_MODEL_FALLBACKS
+        self.timeout = timeout
+        self.session = requests.Session()
+        if self.api_key:
+            self.session.headers.update({"Authorization": f"Bearer {self.api_key}"})
+        self.session.headers.update({"Content-Type": "application/json"})
 
-    def query_ai_engine(self):
-        """Universal AI client with updated 2026 production endpoints."""
-        api_key = os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY")
-        if not api_key:
-            return "[yellow]API key environment variable not detected. Skipping AI executive assessment.[/yellow]"
-
-        # Updated current model IDs
-        candidate_models = [
-            "openai/gpt-oss-120b",
-            "openai/gpt-oss-20b",
-            "qwen/qwen3-32b"
-        ]
-
-        prompt = f"""
-        Target Scope: {self.target}
-        Calculated Risk Score: {self.risk_score}/10
-        Identified Vulnerabilities: {json.dumps(self.risk_factors)}
-        Open Ports Discovered: {json.dumps(self.data.get('ports', []))}
-
-        Act as an elite CISO Red Team Analyst. Provide:
-        1. Concise Executive Threat Summary.
-        2. Primary Adversary Exploit Chain.
-        3. Strategic Hardening Recommendations.
+    def _try_endpoints(self, model: str, prompt: str) -> Tuple[int, Optional[str]]:
         """
-
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        
-        for model in candidate_models:
+        Try possible endpoints for a model. Returns (status_code, text).
+        Handles JSON decode errors and missing fields defensively.
+        """
+        endpoints = [
+            (f"{self.base_url}/v1/chat/completions", self._body_chat),
+            (f"{self.base_url}/v1/completions", self._body_completion),
+            (f"{self.base_url}/v1/engines/{model}/completions", self._body_completion),
+        ]
+        last_status = None
+        last_text = None
+        for url, body_fn in endpoints:
+            body = body_fn(model, prompt)
             try:
-                res = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.2},
-                    timeout=8
-                )
-                if res.status_code == 200:
-                    return res.json()['choices'][0]['message']['content']
-            except Exception:
+                r = self.session.post(url, json=body, timeout=self.timeout)
+                last_status = r.status_code
+                if r.status_code == 404:
+                    logger.debug("AI endpoint 404 for model=%s url=%s", model, url)
+                    last_text = r.text
+                    continue
+                # Try to decode JSON safely
+                try:
+                    j = r.json()
+                except ValueError:
+                    # Not JSON, return raw text
+                    return r.status_code, r.text
+
+                if isinstance(j, dict):
+                    choices = j.get("choices")
+                    if isinstance(choices, list) and len(choices) > 0:
+                        c0 = choices[0]
+                        # Chat style
+                        msg = c0.get("message")
+                        if isinstance(msg, dict):
+                            return r.status_code, msg.get("content", "") or ""
+                        # Completion style
+                        text_choice = c0.get("text") or c0.get("message")
+                        if isinstance(text_choice, str):
+                            return r.status_code, text_choice
+                    # Other common fields
+                    if "output" in j:
+                        return r.status_code, str(j["output"])
+                    if "text" in j:
+                        return r.status_code, j["text"]
+                # Fallback to raw body
+                return r.status_code, r.text
+            except RequestException as e:
+                logger.debug("AI request exception for url=%s: %s", url, e)
+                last_text = str(e)
+                last_status = None
+                continue
+            except Exception as e:
+                logger.debug("Unexpected AI endpoint error for url=%s: %s", url, e)
+                last_text = str(e)
+                continue
+        return last_status or 0, last_text
+
+    def _body_chat(self, model: str, prompt: str) -> dict:
+        return {
+            "model": model,
+            "messages": [{"role": "system", "content": "You are an enterprise threat intelligence assistant."},
+                         {"role": "user", "content": prompt}],
+            "max_tokens": 800,
+            "temperature": 0.0,
+        }
+
+    def _body_completion(self, model: str, prompt: str) -> dict:
+        return {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": 800,
+            "temperature": 0.0,
+        }
+
+    def query(self, prompt: str) -> Tuple[bool, str]:
+        """
+        Query the AI with fallback across models. Returns (success, text).
+        """
+        if not self.base_url:
+            return False, "AI base URL not configured."
+        errors: List[str] = []
+        for model in self.models:
+            status, text = self._try_endpoints(model, prompt)
+            if status == 404:
+                errors.append(f"{model}: 404")
+                continue
+            if status and 200 <= status < 300:
+                return True, text or ""
+            errors.append(f"{model}: status={status} response={str(text)[:240]}")
+        return False, " / ".join(errors) or "No models responded."
+
+def show_mitre_table():
+    """
+    Display MITRE ATT&CK adversary simulation vectors table and operator disclaimer
+    """
+    t = Table(title="MITRE ATT&CK - Adversary Simulation Vectors", box=box.MINIMAL_DOUBLE_HEAD, show_edge=True)
+    t.add_column("Vector", style="bold magenta")
+    t.add_column("Description", style="white")
+    t.add_column("Example Operator Actions (DEFENSIVE USE ONLY)", style="yellow")
+
+    t.add_row(
+        "Application Exploitation (T1190/T1068)",
+        "Target application-level vulnerabilities to gain code execution or privilege escalation within the application context.",
+        "Simulate by exploiting a known CVE in a staging environment to validate WAF/patching and detection."
+    )
+    t.add_row(
+        "Volumetric Stress Resilience (T1499)",
+        "High-volume traffic amplification to test resiliency and DDoS mitigation rules and blackhole routing.",
+        "Generate synthetic, protocol-respecting traffic to simulate volumetric stress against an isolated test cluster."
+    )
+    t.add_row(
+        "Credential Brute-Forcing (T1110)",
+        "Attempt large-scale password guessing against authentication endpoints to validate lockout and monitoring.",
+        "Run controlled credential stuffing from whitelisted IPs against test accounts and validate anomaly alerts."
+    )
+
+    disclaimer = Text()
+    disclaimer.append("Operator disclaimer: ", style="bold red")
+    disclaimer.append(
+        "These adversary simulation vectors are provided for defensive testing and validation only. "
+        "Do NOT perform offensive actions against systems you do not explicitly own or have written authorization to test. "
+        "Always run simulations in controlled/staging environments and follow applicable laws and policies.\n",
+        style="white"
+    )
+    console.print(Panel(t, title="Adversary Simulation"))
+    console.print(Panel(disclaimer, title="Operator Disclaimer", style="red"))
+
+def analyze_target(target: str, args) -> TargetResult:
+    """
+    Runs the full analysis for a single target:
+     - DNS resolution (concurrent)
+     - GeoIP for each IP (concurrent)
+     - Port scan (multi-threaded)
+     - HTTP header audit (for HTTP/HTTPS services)
+    """
+    resolved_ips = resolve_dns(target, timeout=args.timeout)
+    geo_results: Dict[str, GeoIP] = {}
+    header_issues: Dict[str, Optional[str]] = {
+        "Strict-Transport-Security": None,
+        "Content-Security-Policy": None,
+        "X-Frame-Options": None,
+    }
+    open_ports: Dict[str, int] = {}
+
+    # Concurrent GeoIP lookups
+    geo_workers = min(8, max(1, len(resolved_ips) or 1))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=geo_workers) as geo_pool:
+        future_map = {geo_pool.submit(geoip_lookup, ip, args.timeout): ip for ip in resolved_ips}
+        for fut in concurrent.futures.as_completed(future_map):
+            ip = future_map[fut]
+            try:
+                g = fut.result()
+                if g:
+                    geo_results[ip] = g
+                else:
+                    geo_results[ip] = GeoIP(status="error", message="lookup-failed", country=None, region=None, city=None, isp=None, org=None, query=ip, as_info=None, lat=None, lon=None, timezone=None)
+            except Exception as e:
+                geo_results[ip] = GeoIP(status="error", message=str(e), country=None, region=None, city=None, isp=None, org=None, query=ip, as_info=None, lat=None, lon=None, timezone=None)
+
+    # Multi-threaded port scanning with ThreadPoolExecutor
+    # Limit threads to a reasonable maximum to avoid resource exhaustion
+    scan_workers = max(2, min(args.threads, 200))
+    scan_tasks = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=scan_workers) as scan_pool:
+        for svc, port in CRITICAL_PORTS.items():
+            targets_for_scan = resolved_ips if resolved_ips else [target]
+            for ip in targets_for_scan:
+                future = scan_pool.submit(scan_port, ip, port, args.timeout)
+                scan_tasks.append((svc, ip, future))
+
+        for svc, ip, fut in scan_tasks:
+            try:
+                is_open = fut.result()
+                if is_open:
+                    open_ports[svc] = CRITICAL_PORTS[svc]
+            except Exception as e:
+                logger.debug("Port scan task exception for %s on %s: %s", svc, ip, e)
                 continue
 
-        return "[red]AI endpoints unreachable or rate-limited. Operating on core static telemetry engine.[/red]"
+    # HTTP header audit: test HTTP/HTTPS if host resolves
+    try_hosts = [target] + (resolved_ips or [])
+    # Build a set of ports to check (prefer discovered open ones)
+    ports_to_check = []
+    if "HTTPS" in open_ports:
+        ports_to_check.append(443)
+    if "HTTP" in open_ports:
+        ports_to_check.append(80)
+    if not ports_to_check:
+        ports_to_check = [443, 80]
 
-    def run_all(self):
-        console.print(Panel.fit(
-            f"[bold white style=on red] ERSEC v8.0 — PROFESSIONAL ENTERPRISE SECURITY PLATFORM [/]\n"
-            f"[bold cyan]Target Scope:[/] {self.target}",
-            border_style="red"
-        ))
+    # Start headers_audit with default 'missing' to reflect missing unless proven otherwise
+    headers_audit: Dict[str, Optional[str]] = {
+        "Strict-Transport-Security": "missing",
+        "Content-Security-Policy": "missing",
+        "X-Frame-Options": "missing",
+    }
 
-        self.resolve_dns()
+    for p in ports_to_check:
+        for h in try_hosts:
+            ha = audit_http_headers(h, p, timeout=args.timeout)
+            for k, v in ha.items():
+                # If any check shows header present (None), mark it as None (OK).
+                # Otherwise, preserve the most informative message (prefer non-missing reasons)
+                if v is None:
+                    headers_audit[k] = None
+                else:
+                    # preserve existing non-OK reason if more informative
+                    existing = headers_audit.get(k)
+                    if existing in (None, "missing"):
+                        headers_audit[k] = v
+                    else:
+                        # prefer a non-'missing' message
+                        if existing == "missing" and v:
+                            headers_audit[k] = v
 
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
-            progress.add_task(description="Executing Deep Telemetry & Attack Surface Audit...", total=None)
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                executor.submit(self.fetch_geoip)
-                executor.submit(self.audit_http_headers)
-                executor.submit(self.scan_ports)
+    # Normalize header_issues map
+    for k in header_issues:
+        header_issues[k] = headers_audit.get(k)
 
-        final_score = round(min(self.risk_score, 10.0), 1)
-        score_color = "red" if final_score >= 4.0 else "green"
-        console.print(Panel(f"ATTACK SURFACE RISK SCORE: {final_score} / 10.0", border_style=score_color))
+    # Risk scoring
+    score = calculate_risk_score(open_ports, header_issues, geo_results)
 
-        # Conditional Ethical Hacking / Adversary Simulation Vectors (Triggered if score >= 4.0)
-        if final_score >= 4.0:
-            vectors = self.generate_ethical_hacking_vectors()
-            table_vec = Table(title="[bold red]Authorized Ethical Hacking & Adversary Simulation Vectors (MITRE Aligned)[/bold red]", expand=True)
-            table_vec.add_column("Simulation Vector", style="cyan", width=25)
-            table_vec.add_column("MITRE Framework", style="yellow", width=25)
-            table_vec.add_column("Authorized Operator Actions", style="white")
+    # AI intelligence query (optional)
+    ai_insight = None
+    if args.enable_ai and args.ai_base_url:
+        ai_client = AIClient(args.ai_base_url, args.ai_api_key, models=AI_MODEL_FALLBACKS)
+        # Prepare a JSON-serializable geoip map for prompt (avoid raw objects)
+        geoip_for_prompt = {ip: asdict(g) for ip, g in geo_results.items()}
+        prompt = (
+            f"Enterprise threat intelligence summary for target {target}.\n"
+            f"Resolved IPs: {resolved_ips}.\n"
+            f"Open ports: {list(open_ports.keys())}.\n"
+            f"Header issues: {header_issues}.\n"
+            f"GeoIP: {geoip_for_prompt}.\n"
+            "Provide concise prioritized mitigation recommendations."
+        )
+        success, text = ai_client.query(prompt)
+        ai_insight = text if success else f"AI query failed: {text}"
 
-            for v in vectors:
-                table_vec.add_row(v["category"], v["mitre"], v["action"])
-            console.print(table_vec)
-            console.print("[bold yellow]LEGAL DISCLAIMER:[/bold yellow] [dim]These simulation pathways are provided strictly for authorized penetration testing and defensive posture validation under explicit written authorization. 100% legal and operational accountability rests exclusively upon the system operator.[/dim]\n")
+    return TargetResult(
+        target=target,
+        resolved_ips=resolved_ips,
+        geoip=geo_results,
+        open_ports=open_ports,
+        header_issues=header_issues,
+        risk_score=score,
+        ai_insight=ai_insight,
+    )
 
-        # Professional AI Intelligence Output
-        ai_output = self.query_ai_engine()
-        console.print(Panel(ai_output, title="[bold cyan]AI Executive Threat Intelligence Analysis[/bold cyan]", border_style="cyan"))
+def render_results(results: List[TargetResult], args):
+    """
+    Render results to terminal using rich
+    """
+    for r in results:
+        header = f"{r.target}  [score={r.risk_score}]"
+        t = Table.grid(expand=True)
+        t.add_column("field", style="bold cyan", ratio=20)
+        t.add_column("value", style="white", ratio=80)
+        t.add_row("Resolved IPs", ", ".join(r.resolved_ips) or "none")
+        geo_rows = []
+        for ip, g in r.geoip.items():
+            geo_rows.append(f"{ip} -> {g.country or 'n/a'} {g.region or ''} {g.city or ''} ASN:{g.as_info or 'n/a'} ISP:{g.isp or 'n/a'}")
+        t.add_row("GeoIP", "\n".join(geo_rows) if geo_rows else "n/a")
+        t.add_row("Open Ports", ", ".join([f"{svc}({port})" for svc, port in r.open_ports.items()]) or "none")
+        header_issues_rows = []
+        for k, v in r.header_issues.items():
+            header_issues_rows.append(f"{k}: {'OK' if v is None else v}")
+        t.add_row("Header Issues", "\n".join(header_issues_rows))
+        t.add_row("Risk Score", str(r.risk_score))
+        if r.ai_insight:
+            t.add_row("AI Insight", r.ai_insight[:1000])
+        console.print(Panel(t, title=header, width=100))
+
+        # If score >= 4.0 show MITRE table and disclaimer
+        if r.risk_score >= 4.0:
+            show_mitre_table()
+
+def parse_targets_from_file(path: str) -> List[str]:
+    out = []
+    with open(path, "r", encoding="utf8") as fh:
+        for line in fh:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            out.append(s)
+    return out
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="ersec - Enterprise Security Recon & Evaluation CLI")
+    parser.add_argument("--targets", help="Comma-separated list of targets (hostnames or IPs)", type=str)
+    parser.add_argument("--targets-file", help="File with newline-separated targets (comments with #)", type=str)
+    parser.add_argument("--threads", help="Number of threads for port scanning", type=int, default=20)
+    parser.add_argument("--timeout", help="Network timeout seconds", type=float, default=3.0)
+    parser.add_argument("--enable-ai", help="Enable AI Executive Threat Intelligence Analysis", action="store_true")
+    parser.add_argument("--ai-base-url", help="AI base URL (e.g., https://api.openai.com)", type=str, default=os.getenv("AI_BASE_URL", ""))
+    parser.add_argument("--ai-api-key", help="AI API key (or set AI_API_KEY or OPENAI_API_KEY)", type=str, default=os.getenv("AI_API_KEY", ""))
+    parser.add_argument("--output-json", help="Write results to JSON file", type=str, default=None)
+    parser.add_argument("--log-level", help="LOG level", type=str, default=None)
+    args = parser.parse_args(argv)
+
+    if args.log_level:
+        logger.setLevel(args.log_level.upper())
+
+    targets: List[str] = []
+    if args.targets:
+        targets.extend([t.strip() for t in args.targets.split(",") if t.strip()])
+    if args.targets_file:
+        targets.extend(parse_targets_from_file(args.targets_file))
+
+    if not targets:
+        console.print("[bold red]No targets specified. Use --targets or --targets-file[/bold red]")
+        parser.print_help()
+        sys.exit(1)
+
+    # Deduplicate targets preserving order
+    seen = set()
+    unique_targets = []
+    for t in targets:
+        if t not in seen:
+            seen.add(t)
+            unique_targets.append(t)
+    targets = unique_targets
+
+    results: List[TargetResult] = []
+    start = time.time()
+    console.print(Panel.fit(Text("ersec - Enterprise Security Recon & Evaluation", style="bold white"), subtitle="Secure testing, defensive use only", width=80))
+
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), TimeElapsedColumn(), console=console) as progress:
+        task = progress.add_task("Scanning targets...", total=len(targets))
+        max_workers = min(len(targets), max(2, args.threads))
+        # Ensure at least 1 worker
+        max_workers = max(1, max_workers)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_target = {pool.submit(analyze_target, t, args): t for t in targets}
+            for fut in concurrent.futures.as_completed(future_to_target):
+                tname = future_to_target[fut]
+                try:
+                    res = fut.result()
+                    results.append(res)
+                except Exception as e:
+                    logger.exception("Error analyzing %s: %s", tname, e)
+                progress.update(task, advance=1)
+    elapsed = time.time() - start
+    console.print(f"[green]Completed in {elapsed:.2f}s[/green]\n")
+
+    render_results(results, args)
+
+    if args.output_json:
+        try:
+            serializable = []
+            for r in results:
+                rd = asdict(r)
+                # Convert GeoIP dataclass entries to dicts explicitly if any remain
+                rd["geoip"] = {ip: asdict(g) for ip, g in r.geoip.items()}
+                serializable.append(rd)
+            with open(args.output_json, "w", encoding="utf8") as fh:
+                json.dump(serializable, fh, indent=2, ensure_ascii=False)
+            console.print(f"[blue]Results written to {args.output_json}[/blue]")
+        except Exception as e:
+            logger.exception("Failed to write JSON: %s", e)
+            console.print(f"[red]Failed to write JSON: {e}[/red]")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3 or sys.argv[1] != "scan":
-        console.print("[bold red]Usage Error:[/bold red] ersec scan <domain.com>")
-        sys.exit(1)
-    engine = ErsecEngine(sys.argv[2])
-    engine.run_all()
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[red]Interrupted by user[/red]")
+        sys.exit(130)
