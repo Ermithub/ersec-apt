@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 """
-ersec - Enterprise Security Recon & Evaluation CLI
-Path requested: ersec_1.0-1/usr/local/bin/ersec
+ersec - Enterprise Security Recon & Evaluation (Read-Only Reconnaissance Engine)
+Refactored: professional, modular, type-hinted, read-only vulnerability reconnaissance.
 
-Corrected version: added missing imports, JSON decode handling, and explicit socket exception handling.
+Features implemented:
+ - Rich, enterprise-grade --help menu using rich Panels and Text
+ - Deep passive and active (non-exploitative) auditing: DNS enumeration, TLS/SSL checks, HTTP header validation, port scanning, service banner grabbing
+ - Mapping of discovered misconfigurations to MITRE ATT&CK technique IDs (best-effort suggestions) with operator disclaimer
+ - Final polished Rich Table with columns: Finding/Misconfiguration, Severity, MITRE Tactic, MITRE Technique ID, Remediation
+ - Modular code, graceful timeout handling, no exploitation payloads
+
+Usage:
+  ersec --targets example.com,192.0.2.1 [--threads 30] [--timeout 3] [--output-json out.json]
+
+Operator Disclaimer: defensive use only. Obtain written authorization before scanning targets you do not own.
 """
 
 from __future__ import annotations
+
 import argparse
 import concurrent.futures
 import json
 import logging
-import os
 import socket
+import ssl
 import sys
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-import ipaddress
 import requests
 from requests.exceptions import RequestException
-import urllib3
-from urllib3.exceptions import InsecureRequestWarning
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
@@ -30,18 +39,21 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeEl
 from rich.table import Table
 from rich.text import Text
 
-# Suppress insecure request warnings when verify=False is used in requests (kept intentionally for some legacy scans).
-urllib3.disable_warnings(InsecureRequestWarning)
+# Optional dnspython support for richer DNS enumeration; fall back if not installed
+try:
+    import dns.resolver  # type: ignore
+    DNSPYTHON_AVAILABLE = True
+except Exception:
+    DNSPYTHON_AVAILABLE = False
 
-# Configure logging
-logging.basicConfig(
-    level=os.getenv("ERSEC_LOGLEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+# Logging
 logger = logging.getLogger("ersec")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# Constants
-CRITICAL_PORTS = {
+console = Console()
+
+# Critical ports and service hints
+CRITICAL_PORTS: Dict[str, int] = {
     "FTP": 21,
     "SSH": 22,
     "HTTP": 80,
@@ -51,634 +63,526 @@ CRITICAL_PORTS = {
     "Redis": 6379,
 }
 
-AI_MODEL_FALLBACKS = [
-    "llama-3.1-8b-instant",
-    "openai/gpt-oss-120b",
-    "qwen/qwen3-32b",
-]
+# MITRE mapping helper: best-effort suggested mappings
+MITRE_MAP: Dict[str, Tuple[str, str]] = {
+    # finding -> (tactic, technique)
+    "weak_tls_protocol": ("Initial Access / Exfiltration", "T1190"),  # Exploit Public-Facing Application
+    "weak_cipher": ("Initial Access", "T1190"),
+    "expired_certificate": ("Initial Access", "T1190"),
+    "missing_hsts": ("Initial Access", "T1190"),
+    "missing_csp": ("Initial Access", "T1190"),
+    "missing_xframe": ("Defense Evasion", "T1190"),
+    "server_header_disclosure": ("Discovery", "T1595"),
+    "open_remote_service": ("Lateral Movement / Remote Services", "T1021"),
+    "service_version_disclosure": ("Discovery", "T1595"),
+}
 
-IP_API_URL = "http://ip-api.com/json/{ip}?fields=status,message,country,regionName,city,isp,org,query,as,lat,lon,timezone"
-
-console = Console()
-
-@dataclass
-class GeoIP:
-    status: str
-    message: Optional[str]
-    country: Optional[str]
-    region: Optional[str]
-    city: Optional[str]
-    isp: Optional[str]
-    org: Optional[str]
-    query: Optional[str]
-    as_info: Optional[str]
-    lat: Optional[float]
-    lon: Optional[float]
-    timezone: Optional[str]
+# Severity ordering
+SEVERITY_ORDER = ("Low", "Medium", "High", "Critical")
 
 @dataclass
-class TargetResult:
-    target: str
-    resolved_ips: List[str]
-    geoip: Dict[str, GeoIP]  # ip -> GeoIP
-    open_ports: Dict[str, int]  # service -> port (only open ones)
-    header_issues: Dict[str, Optional[str]]  # header -> reason or None
-    risk_score: float
-    ai_insight: Optional[str] = None
+class Finding:
+    finding: str
+    severity: str
+    mitre_tactic: str
+    mitre_technique: str
+    remediation: str
+
+
+def render_help_panel(parser: argparse.ArgumentParser) -> None:
+    """Render a polished rich help panel replacing default argparse help."""
+    header = Text("ersec — Enterprise Security Recon & Evaluation", style="bold white on blue")
+    subtitle = Text("Read-only vulnerability reconnaissance engine — defensive use only", style="bold yellow")
+
+    body = Text()
+    body.append("Usage:\n", style="bold underline")
+    body.append("  ")
+    body.append("ersec --targets example.com,192.0.2.1 [options]\n\n")
+
+    body.append("Deep analysis performed by --targets:\n", style="bold")
+    body.append("  • DNS enumeration (A, AAAA, MX, NS, TXT, CNAME)\n")
+    body.append("  • TLS/SSL analysis (protocol, cipher, certificate validity)\n")
+    body.append("  • Comprehensive HTTP security header validation (HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy)\n")
+    body.append("  • Open port scanning (critical services) and service banner grabbing\n")
+    body.append("  • Mapping findings to suggested MITRE ATT&CK techniques for defensive prioritization\n\n")
+
+    body.append("Important: This tool is strictly non-exploitative. It will NOT run active exploitation payloads. Obtain written authorization before running against systems you do not own.\n", style="bold red")
+
+    panel = Panel.fit(Text.assemble(header, "\n", subtitle, "\n\n", body), title="ersec — Help & Overview", border_style="bright_blue")
+    console.print(panel)
+
+    # Print argparse auto help for flags quickly
+    console.print("Options:")
+    parser.print_help()
+
+
+# Utilities
 
 def is_ip_address(value: str) -> bool:
     try:
-        ipaddress.ip_address(value)
+        socket.inet_pton(socket.AF_INET, value)
         return True
-    except ValueError:
-        return False
-
-def resolve_dns(target: str, timeout: float = 3.0) -> List[str]:
-    """
-    Resolve a hostname to IP addresses. If input is an IP (v4 or v6), return it as-is.
-    Explicitly handles socket.gaierror and related socket exceptions.
-    """
-    # If input is IP already (v4 or v6)
-    if is_ip_address(target):
-        return [target]
-
-    try:
-        infos = socket.getaddrinfo(target, None)
-        ips = sorted({item[4][0] for item in infos})
-        logger.debug("Resolved %s -> %s", target, ips)
-        return ips
-    except socket.gaierror as e:
-        logger.debug("DNS resolution failed for %s (gaierror): %s", target, e)
-        return []
-    except OSError as e:
-        logger.debug("DNS resolution failed for %s (OSError): %s", target, e)
-        return []
-    except Exception as e:
-        logger.debug("Unexpected DNS resolution error for %s: %s", target, e)
-        return []
-
-def geoip_lookup(ip: str, timeout: float = 4.0) -> Optional[GeoIP]:
-    """
-    Lookup geolocation and ASN info using ip-api.com
-    Handles JSON decode errors explicitly and returns a GeoIP with status indicating failure.
-    """
-    try:
-        url = IP_API_URL.format(ip=ip)
-        r = requests.get(url, timeout=timeout)
-        r.raise_for_status()
+    except OSError:
         try:
-            data = r.json()
-        except ValueError as e:
-            logger.debug("GeoIP JSON decode error for %s: %s", ip, e)
-            return GeoIP(status="error", message="invalid-json", country=None, region=None, city=None, isp=None, org=None, query=ip, as_info=None, lat=None, lon=None, timezone=None)
+            socket.inet_pton(socket.AF_INET6, value)
+            return True
+        except OSError:
+            return False
 
-        if data.get("status") != "success":
-            return GeoIP(
-                status=data.get("status", "fail"),
-                message=data.get("message"),
-                country=None, region=None, city=None, isp=None, org=None,
-                query=ip, as_info=None, lat=None, lon=None, timezone=None,
-            )
-        return GeoIP(
-            status="success",
-            message=None,
-            country=data.get("country"),
-            region=data.get("regionName"),
-            city=data.get("city"),
-            isp=data.get("isp"),
-            org=data.get("org"),
-            query=data.get("query"),
-            as_info=data.get("as"),
-            lat=data.get("lat"),
-            lon=data.get("lon"),
-            timezone=data.get("timezone"),
-        )
-    except RequestException as e:
-        logger.debug("GeoIP request failed for %s: %s", ip, e)
-        return GeoIP(status="error", message=str(e), country=None, region=None, city=None, isp=None, org=None, query=ip, as_info=None, lat=None, lon=None, timezone=None)
-    except Exception as e:
-        logger.debug("Unexpected geoip error for %s: %s", ip, e)
-        return GeoIP(status="error", message=str(e), country=None, region=None, city=None, isp=None, org=None, query=ip, as_info=None, lat=None, lon=None, timezone=None)
 
-def audit_http_headers(host: str, port: int, timeout: float = 5.0) -> Dict[str, Optional[str]]:
-    """
-    Fetch headers for host and indicate missing or risky header reasons.
-    Returns a dict of header -> reason (None if present and OK).
-    """
-    result: Dict[str, Optional[str]] = {
-        "Strict-Transport-Security": "missing",
-        "Content-Security-Policy": "missing",
-        "X-Frame-Options": "missing",
-    }
-
-    scheme = "https" if port == 443 else "http"
-    url = f"{scheme}://{host}"
-    # Include non-standard port in URL
-    if port not in (80, 443):
-        url = f"{scheme}://{host}:{port}"
-
+def resolve_dns_all(name: str, timeout: float = 3.0) -> Dict[str, List[str]]:
+    """Resolve common DNS record types. Uses dnspython if available, otherwise falls back to basic getaddrinfo for A/AAAA."""
+    out: Dict[str, List[str]] = {"A": [], "AAAA": [], "MX": [], "NS": [], "TXT": [], "CNAME": []}
     try:
-        # HEAD first, fallback to GET if HEAD yields no headers
-        r = requests.head(url, timeout=timeout, allow_redirects=True, verify=False)
-        headers = r.headers or {}
-        if not headers or r.status_code >= 400:
-            r = requests.get(url, timeout=timeout, allow_redirects=True, verify=False)
-            headers = r.headers or {}
-    except RequestException as e:
-        logger.debug("HTTP header audit request failed for %s: %s", url, e)
-        result["Strict-Transport-Security"] = f"request-failed: {e}"
-        result["Content-Security-Policy"] = f"request-failed: {e}"
-        result["X-Frame-Options"] = f"request-failed: {e}"
-        return result
-    except Exception as e:
-        logger.debug("Unexpected HTTP audit error for %s: %s", url, e)
-        result["Strict-Transport-Security"] = f"request-failed: {e}"
-        result["Content-Security-Policy"] = f"request-failed: {e}"
-        result["X-Frame-Options"] = f"request-failed: {e}"
-        return result
-
-    # HSTS
-    hsts = headers.get("Strict-Transport-Security")
-    if hsts:
-        h_low = hsts.lower()
-        if "max-age" in h_low and "includesubdomains" in h_low:
-            result["Strict-Transport-Security"] = None
-        elif "max-age" in h_low:
-            result["Strict-Transport-Security"] = "present-but-missing-includeSubDomains"
-        else:
-            result["Strict-Transport-Security"] = "present-but-unrecognized-format"
-
-    # CSP
-    csp = headers.get("Content-Security-Policy")
-    if csp:
-        csp_low = csp.lower()
-        if "default-src" in csp_low or "script-src" in csp_low:
-            result["Content-Security-Policy"] = None
-        else:
-            result["Content-Security-Policy"] = "present-but-likely-incomplete"
-
-    # X-Frame-Options
-    xfo = headers.get("X-Frame-Options")
-    if xfo:
-        low = xfo.lower()
-        if any(tok in low for tok in ("deny", "sameorigin")):
-            result["X-Frame-Options"] = None
-        else:
-            result["X-Frame-Options"] = "present-but-weak"
-
-    return result
-
-def scan_port(ip: str, port: int, timeout: float = 2.0) -> bool:
-    """
-    Attempt to open a TCP connection to ip:port. Return True if open.
-    Explicitly handles socket timeouts and OSError.
-    """
-    try:
-        # socket.create_connection raises socket.timeout or OSError/ConnectionRefusedError
-        conn = socket.create_connection((ip, port), timeout=timeout)
-        try:
-            conn.close()
-        except Exception:
-            pass
-        logger.debug("Port open %s:%s", ip, port)
-        return True
-    except (socket.timeout, TimeoutError) as e:
-        logger.debug("Port scan timeout %s:%s - %s", ip, port, e)
-        return False
-    except (ConnectionRefusedError, OSError) as e:
-        # Closed or unreachable
-        logger.debug("Port closed/unreachable %s:%s - %s", ip, port, e)
-        return False
-    except Exception as e:
-        logger.debug("Unexpected error scanning %s:%s - %s", ip, port, e)
-        return False
-
-def calculate_risk_score(open_ports: Dict[str, int], header_issues: Dict[str, Optional[str]], geoip: Dict[str, GeoIP]) -> float:
-    """
-    Calculate a 0.0 - 10.0 risk score. Weighted combination of open critical ports and missing headers and geoip anomalies.
-    """
-    score = 0.0
-    port_weights = {
-        "FTP": 1.0,
-        "SSH": 1.6,
-        "HTTP": 0.6,
-        "HTTPS": 0.3,
-        "MySQL": 1.8,
-        "RDP": 2.0,
-        "Redis": 1.5,
-    }
-    for svc in open_ports:
-        w = port_weights.get(svc, 0.5)
-        score += w
-
-    header_weights = {
-        "Strict-Transport-Security": 1.2,
-        "Content-Security-Policy": 1.6,
-        "X-Frame-Options": 0.6,
-    }
-    for hdr, reason in header_issues.items():
-        if reason is None:
-            continue
-        if isinstance(reason, str) and reason.startswith("request-failed"):
-            score += header_weights.get(hdr, 0.5) * 0.7
-        else:
-            score += header_weights.get(hdr, 0.5)
-
-    for ip, g in geoip.items():
-        if not g or g.status != "success":
-            score += 0.3
-            continue
-        if g.country and g.country.lower() not in ("united states", "united kingdom", "canada", "germany", "france"):
-            score += 0.6
-        as_info = (g.as_info or "").lower()
-        if any(k in as_info for k in ("cloud", "amazon", "google", "microsoft", "ovh", "digitalocean", "linode")):
-            score += 0.4
-
-    score = max(0.0, min(score, 10.0))
-    return round(score, 2)
-
-class AIClient:
-    """
-    Minimal robust AI client using requests with model fallbacks.
-    Attempts multiple endpoints and handles JSON parse errors gracefully.
-    """
-
-    def __init__(self, base_url: str, api_key: Optional[str], models: List[str] = None, timeout: float = 15.0):
-        self.base_url = base_url.rstrip("/") if base_url else ""
-        self.api_key = api_key or os.getenv("AI_API_KEY") or os.getenv("OPENAI_API_KEY")
-        self.models = models or AI_MODEL_FALLBACKS
-        self.timeout = timeout
-        self.session = requests.Session()
-        if self.api_key:
-            self.session.headers.update({"Authorization": f"Bearer {self.api_key}"})
-        self.session.headers.update({"Content-Type": "application/json"})
-
-    def _try_endpoints(self, model: str, prompt: str) -> Tuple[int, Optional[str]]:
-        """
-        Try possible endpoints for a model. Returns (status_code, text).
-        Handles JSON decode errors and missing fields defensively.
-        """
-        endpoints = [
-            (f"{self.base_url}/v1/chat/completions", self._body_chat),
-            (f"{self.base_url}/v1/completions", self._body_completion),
-            (f"{self.base_url}/v1/engines/{model}/completions", self._body_completion),
-        ]
-        last_status = None
-        last_text = None
-        for url, body_fn in endpoints:
-            body = body_fn(model, prompt)
-            try:
-                r = self.session.post(url, json=body, timeout=self.timeout)
-                last_status = r.status_code
-                if r.status_code == 404:
-                    logger.debug("AI endpoint 404 for model=%s url=%s", model, url)
-                    last_text = r.text
-                    continue
-                # Try to decode JSON safely
+        if DNSPYTHON_AVAILABLE:
+            resolver = dns.resolver.Resolver()
+            resolver.lifetime = timeout
+            for qtype in ("A", "AAAA", "MX", "NS", "TXT", "CNAME"):
                 try:
-                    j = r.json()
-                except ValueError:
-                    # Not JSON, return raw text
-                    return r.status_code, r.text
-
-                if isinstance(j, dict):
-                    choices = j.get("choices")
-                    if isinstance(choices, list) and len(choices) > 0:
-                        c0 = choices[0]
-                        # Chat style
-                        msg = c0.get("message")
-                        if isinstance(msg, dict):
-                            return r.status_code, msg.get("content", "") or ""
-                        # Completion style
-                        text_choice = c0.get("text") or c0.get("message")
-                        if isinstance(text_choice, str):
-                            return r.status_code, text_choice
-                    # Other common fields
-                    if "output" in j:
-                        return r.status_code, str(j["output"])
-                    if "text" in j:
-                        return r.status_code, j["text"]
-                # Fallback to raw body
-                return r.status_code, r.text
-            except RequestException as e:
-                logger.debug("AI request exception for url=%s: %s", url, e)
-                last_text = str(e)
-                last_status = None
-                continue
-            except Exception as e:
-                logger.debug("Unexpected AI endpoint error for url=%s: %s", url, e)
-                last_text = str(e)
-                continue
-        return last_status or 0, last_text
-
-    def _body_chat(self, model: str, prompt: str) -> dict:
-        return {
-            "model": model,
-            "messages": [{"role": "system", "content": "You are an enterprise threat intelligence assistant."},
-                         {"role": "user", "content": prompt}],
-            "max_tokens": 800,
-            "temperature": 0.0,
-        }
-
-    def _body_completion(self, model: str, prompt: str) -> dict:
-        return {
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": 800,
-            "temperature": 0.0,
-        }
-
-    def query(self, prompt: str) -> Tuple[bool, str]:
-        """
-        Query the AI with fallback across models. Returns (success, text).
-        """
-        if not self.base_url:
-            return False, "AI base URL not configured."
-        errors: List[str] = []
-        for model in self.models:
-            status, text = self._try_endpoints(model, prompt)
-            if status == 404:
-                errors.append(f"{model}: 404")
-                continue
-            if status and 200 <= status < 300:
-                return True, text or ""
-            errors.append(f"{model}: status={status} response={str(text)[:240]}")
-        return False, " / ".join(errors) or "No models responded."
-
-def show_mitre_table():
-    """
-    Display MITRE ATT&CK adversary simulation vectors table and operator disclaimer
-    """
-    t = Table(title="MITRE ATT&CK - Adversary Simulation Vectors", box=box.MINIMAL_DOUBLE_HEAD, show_edge=True)
-    t.add_column("Vector", style="bold magenta")
-    t.add_column("Description", style="white")
-    t.add_column("Example Operator Actions (DEFENSIVE USE ONLY)", style="yellow")
-
-    t.add_row(
-        "Application Exploitation (T1190/T1068)",
-        "Target application-level vulnerabilities to gain code execution or privilege escalation within the application context.",
-        "Simulate by exploiting a known CVE in a staging environment to validate WAF/patching and detection."
-    )
-    t.add_row(
-        "Volumetric Stress Resilience (T1499)",
-        "High-volume traffic amplification to test resiliency and DDoS mitigation rules and blackhole routing.",
-        "Generate synthetic, protocol-respecting traffic to simulate volumetric stress against an isolated test cluster."
-    )
-    t.add_row(
-        "Credential Brute-Forcing (T1110)",
-        "Attempt large-scale password guessing against authentication endpoints to validate lockout and monitoring.",
-        "Run controlled credential stuffing from whitelisted IPs against test accounts and validate anomaly alerts."
-    )
-
-    disclaimer = Text()
-    disclaimer.append("Operator disclaimer: ", style="bold red")
-    disclaimer.append(
-        "These adversary simulation vectors are provided for defensive testing and validation only. "
-        "Do NOT perform offensive actions against systems you do not explicitly own or have written authorization to test. "
-        "Always run simulations in controlled/staging environments and follow applicable laws and policies.\n",
-        style="white"
-    )
-    console.print(Panel(t, title="Adversary Simulation"))
-    console.print(Panel(disclaimer, title="Operator Disclaimer", style="red"))
-
-def analyze_target(target: str, args) -> TargetResult:
-    """
-    Runs the full analysis for a single target:
-     - DNS resolution (concurrent)
-     - GeoIP for each IP (concurrent)
-     - Port scan (multi-threaded)
-     - HTTP header audit (for HTTP/HTTPS services)
-    """
-    resolved_ips = resolve_dns(target, timeout=args.timeout)
-    geo_results: Dict[str, GeoIP] = {}
-    header_issues: Dict[str, Optional[str]] = {
-        "Strict-Transport-Security": None,
-        "Content-Security-Policy": None,
-        "X-Frame-Options": None,
-    }
-    open_ports: Dict[str, int] = {}
-
-    # Concurrent GeoIP lookups
-    geo_workers = min(8, max(1, len(resolved_ips) or 1))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=geo_workers) as geo_pool:
-        future_map = {geo_pool.submit(geoip_lookup, ip, args.timeout): ip for ip in resolved_ips}
-        for fut in concurrent.futures.as_completed(future_map):
-            ip = future_map[fut]
+                    answers = resolver.resolve(name, qtype)
+                    for r in answers:
+                        out[qtype].append(str(r).rstrip("."))
+                except Exception:
+                    continue
+        else:
+            # Best-effort A/AAAA using getaddrinfo
             try:
-                g = fut.result()
-                if g:
-                    geo_results[ip] = g
-                else:
-                    geo_results[ip] = GeoIP(status="error", message="lookup-failed", country=None, region=None, city=None, isp=None, org=None, query=ip, as_info=None, lat=None, lon=None, timezone=None)
-            except Exception as e:
-                geo_results[ip] = GeoIP(status="error", message=str(e), country=None, region=None, city=None, isp=None, org=None, query=ip, as_info=None, lat=None, lon=None, timezone=None)
-
-    # Multi-threaded port scanning with ThreadPoolExecutor
-    # Limit threads to a reasonable maximum to avoid resource exhaustion
-    scan_workers = max(2, min(args.threads, 200))
-    scan_tasks = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=scan_workers) as scan_pool:
-        for svc, port in CRITICAL_PORTS.items():
-            targets_for_scan = resolved_ips if resolved_ips else [target]
-            for ip in targets_for_scan:
-                future = scan_pool.submit(scan_port, ip, port, args.timeout)
-                scan_tasks.append((svc, ip, future))
-
-        for svc, ip, fut in scan_tasks:
-            try:
-                is_open = fut.result()
-                if is_open:
-                    open_ports[svc] = CRITICAL_PORTS[svc]
-            except Exception as e:
-                logger.debug("Port scan task exception for %s on %s: %s", svc, ip, e)
-                continue
-
-    # HTTP header audit: test HTTP/HTTPS if host resolves
-    try_hosts = [target] + (resolved_ips or [])
-    # Build a set of ports to check (prefer discovered open ones)
-    ports_to_check = []
-    if "HTTPS" in open_ports:
-        ports_to_check.append(443)
-    if "HTTP" in open_ports:
-        ports_to_check.append(80)
-    if not ports_to_check:
-        ports_to_check = [443, 80]
-
-    # Start headers_audit with default 'missing' to reflect missing unless proven otherwise
-    headers_audit: Dict[str, Optional[str]] = {
-        "Strict-Transport-Security": "missing",
-        "Content-Security-Policy": "missing",
-        "X-Frame-Options": "missing",
-    }
-
-    for p in ports_to_check:
-        for h in try_hosts:
-            ha = audit_http_headers(h, p, timeout=args.timeout)
-            for k, v in ha.items():
-                # If any check shows header present (None), mark it as None (OK).
-                # Otherwise, preserve the most informative message (prefer non-missing reasons)
-                if v is None:
-                    headers_audit[k] = None
-                else:
-                    # preserve existing non-OK reason if more informative
-                    existing = headers_audit.get(k)
-                    if existing in (None, "missing"):
-                        headers_audit[k] = v
+                infos = socket.getaddrinfo(name, None)
+                for item in infos:
+                    ip = item[4][0]
+                    if ":" in ip:
+                        out["AAAA"].append(ip)
                     else:
-                        # prefer a non-'missing' message
-                        if existing == "missing" and v:
-                            headers_audit[k] = v
-
-    # Normalize header_issues map
-    for k in header_issues:
-        header_issues[k] = headers_audit.get(k)
-
-    # Risk scoring
-    score = calculate_risk_score(open_ports, header_issues, geo_results)
-
-    # AI intelligence query (optional)
-    ai_insight = None
-    if args.enable_ai and args.ai_base_url:
-        ai_client = AIClient(args.ai_base_url, args.ai_api_key, models=AI_MODEL_FALLBACKS)
-        # Prepare a JSON-serializable geoip map for prompt (avoid raw objects)
-        geoip_for_prompt = {ip: asdict(g) for ip, g in geo_results.items()}
-        prompt = (
-            f"Enterprise threat intelligence summary for target {target}.\n"
-            f"Resolved IPs: {resolved_ips}.\n"
-            f"Open ports: {list(open_ports.keys())}.\n"
-            f"Header issues: {header_issues}.\n"
-            f"GeoIP: {geoip_for_prompt}.\n"
-            "Provide concise prioritized mitigation recommendations."
-        )
-        success, text = ai_client.query(prompt)
-        ai_insight = text if success else f"AI query failed: {text}"
-
-    return TargetResult(
-        target=target,
-        resolved_ips=resolved_ips,
-        geoip=geo_results,
-        open_ports=open_ports,
-        header_issues=header_issues,
-        risk_score=score,
-        ai_insight=ai_insight,
-    )
-
-def render_results(results: List[TargetResult], args):
-    """
-    Render results to terminal using rich
-    """
-    for r in results:
-        header = f"{r.target}  [score={r.risk_score}]"
-        t = Table.grid(expand=True)
-        t.add_column("field", style="bold cyan", ratio=20)
-        t.add_column("value", style="white", ratio=80)
-        t.add_row("Resolved IPs", ", ".join(r.resolved_ips) or "none")
-        geo_rows = []
-        for ip, g in r.geoip.items():
-            geo_rows.append(f"{ip} -> {g.country or 'n/a'} {g.region or ''} {g.city or ''} ASN:{g.as_info or 'n/a'} ISP:{g.isp or 'n/a'}")
-        t.add_row("GeoIP", "\n".join(geo_rows) if geo_rows else "n/a")
-        t.add_row("Open Ports", ", ".join([f"{svc}({port})" for svc, port in r.open_ports.items()]) or "none")
-        header_issues_rows = []
-        for k, v in r.header_issues.items():
-            header_issues_rows.append(f"{k}: {'OK' if v is None else v}")
-        t.add_row("Header Issues", "\n".join(header_issues_rows))
-        t.add_row("Risk Score", str(r.risk_score))
-        if r.ai_insight:
-            t.add_row("AI Insight", r.ai_insight[:1000])
-        console.print(Panel(t, title=header, width=100))
-
-        # If score >= 4.0 show MITRE table and disclaimer
-        if r.risk_score >= 4.0:
-            show_mitre_table()
-
-def parse_targets_from_file(path: str) -> List[str]:
-    out = []
-    with open(path, "r", encoding="utf8") as fh:
-        for line in fh:
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            out.append(s)
+                        out["A"].append(ip)
+                # Deduplicate
+                out["A"] = sorted(set(out["A"]))
+                out["AAAA"] = sorted(set(out["AAAA"]))
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("DNS enumeration error for %s: %s", name, e)
     return out
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="ersec - Enterprise Security Recon & Evaluation CLI")
-    parser.add_argument("--targets", help="Comma-separated list of targets (hostnames or IPs)", type=str)
-    parser.add_argument("--targets-file", help="File with newline-separated targets (comments with #)", type=str)
-    parser.add_argument("--threads", help="Number of threads for port scanning", type=int, default=20)
-    parser.add_argument("--timeout", help="Network timeout seconds", type=float, default=3.0)
-    parser.add_argument("--enable-ai", help="Enable AI Executive Threat Intelligence Analysis", action="store_true")
-    parser.add_argument("--ai-base-url", help="AI base URL (e.g., https://api.openai.com)", type=str, default=os.getenv("AI_BASE_URL", ""))
-    parser.add_argument("--ai-api-key", help="AI API key (or set AI_API_KEY or OPENAI_API_KEY)", type=str, default=os.getenv("AI_API_KEY", ""))
-    parser.add_argument("--output-json", help="Write results to JSON file", type=str, default=None)
-    parser.add_argument("--log-level", help="LOG level", type=str, default=None)
+
+def tcp_banner_grab(host: str, port: int, timeout: float = 3.0) -> Optional[str]:
+    """Attempt to read a service banner from host:port. Non-intrusive: opens TCP connection and reads first bytes."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            # For HTTP, send a minimal request to elicit headers
+            if port in (80, 443):
+                try:
+                    req = f"HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                    s.sendall(req.encode("utf-8", errors="ignore"))
+                except Exception:
+                    pass
+            try:
+                data = s.recv(4096)
+                if not data:
+                    return None
+                # decode safely
+                try:
+                    return data.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    return repr(data)
+            except Exception:
+                return None
+    except (socket.timeout, ConnectionRefusedError) as e:
+        logger.debug("Banner grab timeout/refused %s:%s - %s", host, port, e)
+        return None
+    except Exception as e:
+        logger.debug("Unexpected banner grab error %s:%s - %s", host, port, e)
+        return None
+
+
+def tls_inspect(host: str, port: int = 443, timeout: float = 5.0) -> Dict[str, Optional[str]]:
+    """Perform TLS handshake and return protocol, cipher, cert validity info. Non-invasive."""
+    info: Dict[str, Optional[str]] = {"protocol": None, "cipher": None, "cert_subject": None, "cert_issuer": None, "cert_expiry": None, "cert_valid": None}
+    context = ssl.create_default_context()
+    # Do not verify host cert for inspection purposes, but still read it
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=host) as ssock:
+                proto = ssock.version()
+                cipher = ssock.cipher()
+                info["protocol"] = proto
+                info["cipher"] = cipher[0] if cipher else None
+                try:
+                    cert = ssock.getpeercert()
+                    if cert:
+                        subj = cert.get("subject")
+                        issuer = cert.get("issuer")
+                        notAfter = cert.get("notAfter")
+                        info["cert_subject"] = str(subj)
+                        info["cert_issuer"] = str(issuer)
+                        info["cert_expiry"] = notAfter
+                        # parse expiry
+                        try:
+                            expiry_dt = datetime.strptime(notAfter, "%b %d %H:%M:%S %Y %Z")
+                        except Exception:
+                            try:
+                                expiry_dt = datetime.strptime(notAfter, "%Y%m%d%H%M%SZ")
+                            except Exception:
+                                expiry_dt = None
+                        if expiry_dt:
+                            info["cert_valid"] = "expired" if expiry_dt < datetime.utcnow() else "valid"
+                        else:
+                            info["cert_valid"] = "unknown"
+                except Exception:
+                    logger.debug("Failed to parse peer cert for %s:%s", host, port)
+    except Exception as e:
+        logger.debug("TLS inspect failed for %s:%s - %s", host, port, e)
+    return info
+
+
+def http_header_audit(url: str, timeout: float = 5.0) -> Dict[str, Optional[str]]:
+    """Fetch HTTP headers and evaluate security headers. Non-destructive."""
+    headers = {}
+    try:
+        r = requests.head(url, timeout=timeout, allow_redirects=True)
+        hdrs = r.headers or {}
+        if not hdrs or r.status_code >= 400:
+            r = requests.get(url, timeout=timeout, allow_redirects=True)
+            hdrs = r.headers or {}
+    except RequestException as e:
+        logger.debug("HTTP header fetch failed for %s: %s", url, e)
+        return {"error": str(e)}
+
+    # Evaluate headers
+    checks: Dict[str, Optional[str]] = {}
+    # HSTS
+    hsts = hdrs.get("Strict-Transport-Security")
+    if hsts:
+        checks["hsts"] = None
+    else:
+        checks["hsts"] = "missing"
+    # CSP
+    csp = hdrs.get("Content-Security-Policy")
+    checks["csp"] = None if csp else "missing"
+    # X-Frame-Options
+    xfo = hdrs.get("X-Frame-Options")
+    checks["xframe"] = None if xfo else "missing"
+    # X-Content-Type-Options
+    xcto = hdrs.get("X-Content-Type-Options")
+    checks["xcontenttype"] = None if xcto else "missing"
+    # Referrer-Policy
+    ref = hdrs.get("Referrer-Policy")
+    checks["referrer"] = None if ref else "missing"
+    # Permissions-Policy / Feature-Policy
+    perm = hdrs.get("Permissions-Policy") or hdrs.get("Feature-Policy")
+    checks["permissions"] = None if perm else "missing"
+    # Server header disclosure
+    server = hdrs.get("Server")
+    checks["server"] = server or None
+
+    checks["raw_headers"] = dict(hdrs)
+    return checks
+
+
+def map_finding_to_mitre(key: str) -> Tuple[str, str]:
+    """Return (tactic, technique) mapping or default placeholders. Use MITRE_MAP best-effort mappings."""
+    if key in MITRE_MAP:
+        return MITRE_MAP[key]
+    # default fallback
+    return ("Discovery", "T1595")
+
+
+def assess_findings_for_target(target: str, resolved_ips: List[str], open_ports: Dict[str, int], tls_info: Dict[str, Optional[str]], header_checks: Dict[str, Optional[str]], banners: Dict[str, Optional[str]]) -> List[Finding]:
+    findings: List[Finding] = []
+
+    # TLS findings
+    proto = tls_info.get("protocol")
+    cipher = tls_info.get("cipher")
+    cert_valid = tls_info.get("cert_valid")
+    if proto and proto.upper() not in ("TLSv1.2", "TLSv1.3"):
+        tactic, tech = map_finding_to_mitre("weak_tls_protocol")
+        findings.append(Finding(
+            finding=f"Weak TLS protocol: {proto}",
+            severity="High",
+            mitre_tactic=tactic,
+            mitre_technique=tech,
+            remediation="Disable legacy TLS versions (TLS 1.0/1.1) and enable TLS 1.2+; enforce strong server-side configuration.",
+        ))
+    # weak cipher heuristics
+    weak_keywords = ("RC4", "DES", "3DES", "NULL", "EXPORT")
+    if cipher and any(k.lower() in (cipher or "").lower() for k in weak_keywords):
+        tactic, tech = map_finding_to_mitre("weak_cipher")
+        findings.append(Finding(
+            finding=f"Weak TLS cipher in use: {cipher}",
+            severity="Medium",
+            mitre_tactic=tactic,
+            mitre_technique=tech,
+            remediation="Remove weak ciphers from server configuration and prefer AEAD ciphers like AES-GCM and ChaCha20-Poly1305.",
+        ))
+    if cert_valid == "expired":
+        tactic, tech = map_finding_to_mitre("expired_certificate")
+        findings.append(Finding(
+            finding="TLS certificate expired",
+            severity="High",
+            mitre_tactic=tactic,
+            mitre_technique=tech,
+            remediation="Replace certificate with a valid certificate and ensure automated renewal (e.g., via ACME/LetsEncrypt) is configured.",
+        ))
+
+    # Header findings
+    if header_checks:
+        if header_checks.get("hsts") == "missing":
+            tactic, tech = map_finding_to_mitre("missing_hsts")
+            findings.append(Finding(
+                finding="Missing Strict-Transport-Security header (HSTS)",
+                severity="Medium",
+                mitre_tactic=tactic,
+                mitre_technique=tech,
+                remediation="Add Strict-Transport-Security: max-age=31536000; includeSubDomains; preload after validation.",
+            ))
+        if header_checks.get("csp") == "missing":
+            tactic, tech = map_finding_to_mitre("missing_csp")
+            findings.append(Finding(
+                finding="Missing Content-Security-Policy header (CSP)",
+                severity="Medium",
+                mitre_tactic=tactic,
+                mitre_technique=tech,
+                remediation="Implement a restrictive Content-Security-Policy; start with reporting-only mode to evaluate impact.",
+            ))
+        if header_checks.get("xframe") == "missing":
+            tactic, tech = map_finding_to_mitre("missing_xframe")
+            findings.append(Finding(
+                finding="Missing X-Frame-Options header",
+                severity="Low",
+                mitre_tactic=tactic,
+                mitre_technique=tech,
+                remediation="Add X-Frame-Options: DENY or SAMEORIGIN or use CSP frame-ancestors directive.",
+            ))
+        if header_checks.get("xcontenttype") == "missing":
+            findings.append(Finding(
+                finding="Missing X-Content-Type-Options header",
+                severity="Low",
+                mitre_tactic="Defense Evasion",
+                mitre_technique="T1595",
+                remediation="Add X-Content-Type-Options: nosniff to prevent MIME type sniffing.",
+            ))
+        if header_checks.get("server"):
+            tactic, tech = map_finding_to_mitre("server_header_disclosure")
+            findings.append(Finding(
+                finding=f"Server header disclosure: {header_checks.get('server')}",
+                severity="Low",
+                mitre_tactic=tactic,
+                mitre_technique=tech,
+                remediation="Remove or obfuscate Server header; avoid exposing software versions to public requests.",
+            ))
+
+    # Open ports and banners
+    for svc, port in open_ports.items():
+        tactic, tech = map_finding_to_mitre("open_remote_service")
+        rem = f"If service {svc} is unnecessary, stop and disable it. Otherwise, restrict access via firewall/VPC and require MFA where applicable."
+        findings.append(Finding(
+            finding=f"Open service port: {svc} ({port})",
+            severity="Medium" if svc not in ("RDP", "MySQL") else "High",
+            mitre_tactic=tactic,
+            mitre_technique=tech,
+            remediation=rem,
+        ))
+        banner = banners.get(str(port))
+        if banner:
+            findings.append(Finding(
+                finding=f"Service banner on {svc}:{port} reveals: {banner.splitlines()[0][:200]}",
+                severity="Low",
+                mitre_tactic=map_finding_to_mitre("service_version_disclosure")[0],
+                mitre_technique=map_finding_to_mitre("service_version_disclosure")[1],
+                remediation="Avoid exposing version strings in banners; configure services to limit informational responses.",
+            ))
+
+    return findings
+
+
+def analyze_target(target: str, threads: int, timeout: float) -> Dict[str, object]:
+    """Run read-only reconnaissance and return structured results including Findings."""
+    start = time.time()
+    resolved = []
+    dns_info = {}
+    if is_ip_address(target):
+        resolved = [target]
+    else:
+        # Resolve basic A/AAAA
+        try:
+            infos = socket.getaddrinfo(target, None)
+            resolved = sorted({item[4][0] for item in infos})
+        except Exception:
+            resolved = []
+        dns_info = resolve_dns_all(target, timeout=timeout)
+
+    # Port scan (limited set) and banner grabbing
+    open_ports: Dict[str, int] = {}
+    banners: Dict[str, Optional[str]] = {}
+
+    def check_port(svc_port: Tuple[str, int]) -> Tuple[str, int, bool]:
+        svc, port = svc_port
+        ips = resolved or [target]
+        # check first reachable IP
+        for ip in ips:
+            try:
+                with socket.create_connection((ip, port), timeout=timeout) as s:
+                    s.close()
+                    return svc, port, True
+            except Exception:
+                continue
+        return svc, port, False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(2, threads)) as pool:
+        futures = {pool.submit(check_port, item): item for item in CRITICAL_PORTS.items()}
+        for fut in concurrent.futures.as_completed(futures):
+            svc, port = futures[fut]
+            try:
+                svc, port, is_open = fut.result()
+                if is_open:
+                    open_ports[svc] = port
+            except Exception as e:
+                logger.debug("Error scanning %s:%s - %s", svc, port, e)
+
+    # Banner grabbing for open ports
+    for svc, port in open_ports.items():
+        ip = (resolved[0] if resolved else target)
+        banner = tcp_banner_grab(ip, port, timeout=timeout)
+        banners[str(port)] = banner
+
+    # TLS inspection if HTTPS detected or port 443 open
+    tls_info = {}
+    if "HTTPS" in open_ports or 443 in open_ports.values():
+        try:
+            tls_info = tls_inspect(target if not is_ip_address(target) else resolved[0], port=443, timeout=timeout)
+        except Exception as e:
+            logger.debug("TLS inspect exception: %s", e)
+            tls_info = {}
+    else:
+        tls_info = {}
+
+    # HTTP header audit if HTTP/HTTPS available
+    header_checks = {}
+    if "HTTP" in open_ports or "HTTPS" in open_ports:
+        scheme = "https" if "HTTPS" in open_ports else "http"
+        url = f"{scheme}://{target}"
+        header_checks = http_header_audit(url, timeout=timeout)
+
+    findings = assess_findings_for_target(target, resolved, open_ports, tls_info, header_checks, banners)
+
+    result = {
+        "target": target,
+        "resolved_ips": resolved,
+        "dns": dns_info,
+        "open_ports": open_ports,
+        "banners": banners,
+        "tls": tls_info,
+        "headers": header_checks,
+        "findings": [asdict(f) for f in findings],
+        "elapsed": time.time() - start,
+    }
+    return result
+
+
+def render_findings_table(all_findings: List[Tuple[str, Finding]]):
+    """Render Rich table with exact columns required."""
+    table = Table(title="ersec Findings", box=box.SIMPLE_HEAVY)
+    table.add_column("Target", style="cyan", no_wrap=True)
+    table.add_column("Finding/Misconfiguration", style="magenta")
+    table.add_column("Severity", style="red")
+    table.add_column("MITRE Tactic", style="yellow")
+    table.add_column("MITRE Technique ID", style="green")
+    table.add_column("Remediation", style="white")
+
+    for target, f in all_findings:
+        table.add_row(target, f.finding, f.severity, f.mitre_tactic, f.mitre_technique, f.remediation)
+
+    console.print(table)
+
+
+def operator_disclaimer():
+    txt = Text()
+    txt.append("Operator Disclaimer\n", style="bold red")
+    txt.append("This tool performs non-exploitative reconnaissance and provides defensive findings only. Do NOT run it against systems without explicit written authorization. The MITRE ATT&CK mappings are suggestions for defensive prioritization and should be validated by experienced analysts.\n")
+    console.print(Panel(txt, title="Operator Disclaimer", border_style="red"))
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--targets", help="Comma-separated list of targets (hostnames or IPs)")
+    parser.add_argument("--targets-file", help="File with newline-separated targets (comments with #)")
+    parser.add_argument("--threads", type=int, default=20, help="Number of threads for scanning")
+    parser.add_argument("--timeout", type=float, default=3.0, help="Network timeout seconds")
+    parser.add_argument("--output-json", help="Write results to JSON file")
+    parser.add_argument("--help", "-h", action="store_true", help="Show help and exit")
+
     args = parser.parse_args(argv)
 
-    if args.log_level:
-        logger.setLevel(args.log_level.upper())
+    if args.help:
+        render_help_panel(parser)
+        return 0
 
     targets: List[str] = []
     if args.targets:
         targets.extend([t.strip() for t in args.targets.split(",") if t.strip()])
     if args.targets_file:
-        targets.extend(parse_targets_from_file(args.targets_file))
+        try:
+            with open(args.targets_file, "r", encoding="utf8") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    targets.append(s)
+        except Exception as e:
+            console.print(f"[red]Failed to read targets file: {e}[/red]")
+            return 2
 
     if not targets:
-        console.print("[bold red]No targets specified. Use --targets or --targets-file[/bold red]")
-        parser.print_help()
-        sys.exit(1)
+        console.print("[bold red]No targets specified. Use --targets or --targets-file. Use --help for detailed usage.[/bold red]")
+        return 2
 
-    # Deduplicate targets preserving order
-    seen = set()
-    unique_targets = []
-    for t in targets:
-        if t not in seen:
-            seen.add(t)
-            unique_targets.append(t)
-    targets = unique_targets
+    console.print(Panel(Text("ersec — Enterprise Security Reconnaissance (Read-Only)\nDefensive, non-exploitative scanning only", justify="center"), border_style="blue"))
+    operator_disclaimer()
 
-    results: List[TargetResult] = []
-    start = time.time()
-    console.print(Panel.fit(Text("ersec - Enterprise Security Recon & Evaluation", style="bold white"), subtitle="Secure testing, defensive use only", width=80))
+    results = []
+    findings_accum: List[Tuple[str, Finding]] = []
 
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), TimeElapsedColumn(), console=console) as progress:
         task = progress.add_task("Scanning targets...", total=len(targets))
-        max_workers = min(len(targets), max(2, args.threads))
-        # Ensure at least 1 worker
-        max_workers = max(1, max_workers)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_to_target = {pool.submit(analyze_target, t, args): t for t in targets}
-            for fut in concurrent.futures.as_completed(future_to_target):
-                tname = future_to_target[fut]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(targets), max(2, args.threads))) as pool:
+            future_map = {pool.submit(analyze_target, t, args.threads, args.timeout): t for t in targets}
+            for fut in concurrent.futures.as_completed(future_map):
+                t = future_map[fut]
                 try:
                     res = fut.result()
                     results.append(res)
+                    # Extract findings
+                    for fdict in res.get("findings", []):
+                        f = Finding(**fdict)
+                        findings_accum.append((t, f))
                 except Exception as e:
-                    logger.exception("Error analyzing %s: %s", tname, e)
+                    logger.exception("Error analyzing %s: %s", t, e)
                 progress.update(task, advance=1)
-    elapsed = time.time() - start
-    console.print(f"[green]Completed in {elapsed:.2f}s[/green]\n")
 
-    render_results(results, args)
+    # Render findings table
+    if findings_accum:
+        render_findings_table(findings_accum)
+    else:
+        console.print(Panel(Text("No findings detected by current checks. Review results and consider enabling additional scanners or reviewing manually."), title="Summary", border_style="green"))
 
+    # Optional JSON output
     if args.output_json:
         try:
-            serializable = []
-            for r in results:
-                rd = asdict(r)
-                # Convert GeoIP dataclass entries to dicts explicitly if any remain
-                rd["geoip"] = {ip: asdict(g) for ip, g in r.geoip.items()}
-                serializable.append(rd)
             with open(args.output_json, "w", encoding="utf8") as fh:
-                json.dump(serializable, fh, indent=2, ensure_ascii=False)
+                json.dump(results, fh, indent=2, ensure_ascii=False)
             console.print(f"[blue]Results written to {args.output_json}[/blue]")
         except Exception as e:
             logger.exception("Failed to write JSON: %s", e)
             console.print(f"[red]Failed to write JSON: {e}[/red]")
 
+    return 0
+
+
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except KeyboardInterrupt:
         console.print("\n[red]Interrupted by user[/red]")
         sys.exit(130)
