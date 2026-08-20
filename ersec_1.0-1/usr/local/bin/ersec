@@ -22,11 +22,13 @@ import argparse
 import concurrent.futures
 import json
 import logging
+import os
+import re
 import socket
 import ssl
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -87,6 +89,10 @@ class Finding:
     mitre_tactic: str
     mitre_technique: str
     remediation: str
+    # New optional CVE enrichment fields
+    cve_id: Optional[str] = None
+    cvss: Optional[str] = None
+    cve_desc: Optional[str] = None
 
 
 def render_help_panel(parser: argparse.ArgumentParser) -> None:
@@ -106,7 +112,7 @@ def render_help_panel(parser: argparse.ArgumentParser) -> None:
     body.append("  • Open port scanning (critical services) and service banner grabbing\n")
     body.append("  • Mapping findings to suggested MITRE ATT&CK techniques for defensive prioritization\n\n")
 
-    body.append("Important: This tool is strictly non-exploitative. It will NOT run active exploitation payloads. Obtain written authorization before running against systems you do not own.\n", style="bold red")
+    body.append("Important: This tool is strictly non-exploitative. It will NOT run active exploitation payloads. Obtain written authorization before running against systems you do not own.\n")
 
     panel = Panel.fit(Text.assemble(header, "\n", subtitle, "\n\n", body), title="ersec — Help & Overview", border_style="bright_blue")
     console.print(panel)
@@ -289,6 +295,141 @@ def map_finding_to_mitre(key: str) -> Tuple[str, str]:
     return ("Discovery", "T1595")
 
 
+def extract_version_candidates(banners: Dict[str, Optional[str]], raw_headers: Dict[str, str]) -> List[Tuple[str, str]]:
+    """Extract (product, version) candidates from banners and Server headers using heuristics."""
+    candidates: List[Tuple[str, str]] = []
+    rx = re.compile(r"([A-Za-z0-9\-_+.]+)[/ ]([0-9]+(?:\.[0-9]+){0,2})")
+    # From banners
+    for port, banner in banners.items():
+        if not banner:
+            continue
+        # search first line
+        first_line = banner.splitlines()[0]
+        for m in rx.finditer(first_line):
+            prod = m.group(1)
+            ver = m.group(2)
+            candidates.append((prod, ver))
+    # From Server header
+    server = raw_headers.get("Server") if raw_headers else None
+    if server:
+        for m in rx.finditer(server):
+            candidates.append((m.group(1), m.group(2)))
+    # From other headers (e.g., X-Powered-By)
+    for _, v in (raw_headers or {}).items():
+        if not isinstance(v, str):
+            continue
+        for m in rx.finditer(v):
+            candidates.append((m.group(1), m.group(2)))
+    # Deduplicate preserving order
+    seen = set()
+    out: List[Tuple[str, str]] = []
+    for p, v in candidates:
+        key = f"{p}:{v}".lower()
+        if key not in seen:
+            seen.add(key)
+            out.append((p, v))
+    return out
+
+
+def query_nvd_for_keyword(keyword: str, api_key: Optional[str] = None, results_per_page: int = 5, timeout: float = 8.0) -> List[Dict[str, str]]:
+    """Query NVD JSON API v2.0 for a keyword and return a list of simplified CVE dicts.
+    This function is read-only and only performs safe API queries.
+    """
+    base = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    headers = {}
+    if api_key:
+        headers["API-Key"] = api_key
+    params = {"keyword": keyword, "resultsPerPage": results_per_page}
+    try:
+        r = requests.get(base, params=params, headers=headers, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        vulns = data.get("vulnerabilities") or []
+        out = []
+        for v in vulns:
+            cve = v.get("cve") or {}
+            cve_id = cve.get("id")
+            descriptions = cve.get("descriptions") or []
+            desc = ""
+            for d in descriptions:
+                if d.get("lang") == "en":
+                    desc = d.get("value")
+                    break
+            # Extract CVSS if present (v3 preferred)
+            cvss_val = None
+            metrics = v.get("cveMetrics") or v.get("metrics") or {}
+            # v2.0 response may include 'metrics' with cvssMetricV3
+            try:
+                # Try multiple locations safely
+                cvss3 = None
+                if isinstance(metrics, dict):
+                    # search for known keys
+                    if "cvssMetricV31" in metrics and metrics["cvssMetricV31"]:
+                        cvss3 = metrics["cvssMetricV31"][0].get("cvssData", {}).get("baseSeverity")
+                    elif "cvssMetricV30" in metrics and metrics["cvssMetricV30"]:
+                        cvss3 = metrics["cvssMetricV30"][0].get("cvssData", {}).get("baseSeverity")
+                # Fallback to searching inside cve object
+                if not cvss3:
+                    # many responses include 'score' structures; try to find v3 vector
+                    # This is best-effort and tolerant of schema differences
+                    if isinstance(cve.get("metrics"), dict):
+                        m = cve.get("metrics")
+                        if m.get("cvssMetricV31"):
+                            cvss3 = m["cvssMetricV31"][0].get("cvssData", {}).get("baseSeverity")
+                        elif m.get("cvssMetricV30"):
+                            cvss3 = m["cvssMetricV30"][0].get("cvssData", {}).get("baseSeverity")
+                cvss_val = cvss3
+            except Exception:
+                cvss_val = None
+            out.append({"cve_id": cve_id, "cvss": cvss_val or "N/A", "description": desc or ""})
+        return out
+    except Exception as e:
+        logger.debug("NVD query failed for %s: %s", keyword, e)
+        return []
+
+
+def enrich_findings_with_cves(findings: List[Finding], version_candidates: List[Tuple[str, str]], nvd_api_key: Optional[str] = None) -> None:
+    """For findings that mention service version disclosure, query NVD for matching product+version keywords and enrich the Finding objects in-place.
+
+    This keeps behaviour read-only: only queries public NVD API.
+    """
+    if not version_candidates:
+        return
+    # Build searchable keywords: product and product+version
+    keywords = []
+    for prod, ver in version_candidates:
+        keywords.append(prod)
+        keywords.append(f"{prod} {ver}")
+        keywords.append(f"{prod}/{ver}")
+    # de-duplicate
+    keywords = list(dict.fromkeys(keywords))
+
+    # Query NVD for each keyword until we find something useful
+    nvd_cache: Dict[str, List[Dict[str, str]]] = {}
+    for kw in keywords:
+        nvd_cache[kw] = query_nvd_for_keyword(kw, api_key=nvd_api_key)
+
+    # For each finding that looks like a version disclosure, attach the most relevant CVE (first with a CVE id)
+    for f in findings:
+        if "reveals" in f.finding.lower() or "version" in f.finding.lower() or "disclosure" in f.finding.lower():
+            # find best match in cache
+            selected = None
+            for kw, vulns in nvd_cache.items():
+                if not vulns:
+                    continue
+                # pick first vuln with id
+                for v in vulns:
+                    if v.get("cve_id"):
+                        selected = v
+                        break
+                if selected:
+                    break
+            if selected:
+                f.cve_id = selected.get("cve_id")
+                f.cvss = selected.get("cvss")
+                f.cve_desc = (selected.get("description") or "").strip()
+
+
 def assess_findings_for_target(target: str, resolved_ips: List[str], open_ports: Dict[str, int], tls_info: Dict[str, Optional[str]], header_checks: Dict[str, Optional[str]], banners: Dict[str, Optional[str]]) -> List[Finding]:
     findings: List[Finding] = []
 
@@ -296,7 +437,7 @@ def assess_findings_for_target(target: str, resolved_ips: List[str], open_ports:
     proto = tls_info.get("protocol")
     cipher = tls_info.get("cipher")
     cert_valid = tls_info.get("cert_valid")
-    if proto and proto.upper() not in ("TLSv1.2", "TLSv1.3"):
+    if proto and proto.upper() not in ("TLSV1.2", "TLSV1.3"):
         tactic, tech = map_finding_to_mitre("weak_tls_protocol")
         findings.append(Finding(
             finding=f"Weak TLS protocol: {proto}",
@@ -386,8 +527,10 @@ def assess_findings_for_target(target: str, resolved_ips: List[str], open_ports:
         ))
         banner = banners.get(str(port))
         if banner:
+            # include only first line snippet
+            first_line = banner.splitlines()[0][:200]
             findings.append(Finding(
-                finding=f"Service banner on {svc}:{port} reveals: {banner.splitlines()[0][:200]}",
+                finding=f"Service banner on {svc}:{port} reveals: {first_line}",
                 severity="Low",
                 mitre_tactic=map_finding_to_mitre("service_version_disclosure")[0],
                 mitre_technique=map_finding_to_mitre("service_version_disclosure")[1],
@@ -397,7 +540,7 @@ def assess_findings_for_target(target: str, resolved_ips: List[str], open_ports:
     return findings
 
 
-def analyze_target(target: str, threads: int, timeout: float) -> Dict[str, object]:
+def analyze_target(target: str, threads: int, timeout: float, nvd_api_key: Optional[str] = None, shodan_key: Optional[str] = None, censys_key: Optional[str] = None) -> Dict[str, object]:
     """Run read-only reconnaissance and return structured results including Findings."""
     start = time.time()
     resolved = []
@@ -465,7 +608,16 @@ def analyze_target(target: str, threads: int, timeout: float) -> Dict[str, objec
         url = f"{scheme}://{target}"
         header_checks = http_header_audit(url, timeout=timeout)
 
+    # Version candidates (from banners and headers)
+    version_candidates = extract_version_candidates(banners, header_checks.get("raw_headers") or {})
+
     findings = assess_findings_for_target(target, resolved, open_ports, tls_info, header_checks, banners)
+
+    # Enrich findings with NVD/CVE info for version-related disclosures (read-only)
+    try:
+        enrich_findings_with_cves(findings, version_candidates, nvd_api_key=nvd_api_key)
+    except Exception as e:
+        logger.debug("CVE enrichment failed: %s", e)
 
     result = {
         "target": target,
@@ -475,6 +627,7 @@ def analyze_target(target: str, threads: int, timeout: float) -> Dict[str, objec
         "banners": banners,
         "tls": tls_info,
         "headers": header_checks,
+        "version_candidates": version_candidates,
         "findings": [asdict(f) for f in findings],
         "elapsed": time.time() - start,
     }
@@ -489,10 +642,23 @@ def render_findings_table(all_findings: List[Tuple[str, Finding]]):
     table.add_column("Severity", style="red")
     table.add_column("MITRE Tactic", style="yellow")
     table.add_column("MITRE Technique ID", style="green")
+    table.add_column("CVE ID", style="bright_blue")
+    table.add_column("CVSS Severity", style="bright_red")
+    table.add_column("CVE Description", style="white")
     table.add_column("Remediation", style="white")
 
     for target, f in all_findings:
-        table.add_row(target, f.finding, f.severity, f.mitre_tactic, f.mitre_technique, f.remediation)
+        table.add_row(
+            target,
+            f.finding,
+            f.severity,
+            f.mitre_tactic,
+            f.mitre_technique,
+            f.cve_id or "",
+            f.cvss or "",
+            (f.cve_desc or "")[:120],
+            f.remediation,
+        )
 
     console.print(table)
 
@@ -500,7 +666,7 @@ def render_findings_table(all_findings: List[Tuple[str, Finding]]):
 def operator_disclaimer():
     txt = Text()
     txt.append("Operator Disclaimer\n", style="bold red")
-    txt.append("This tool performs non-exploitative reconnaissance and provides defensive findings only. Do NOT run it against systems without explicit written authorization. The MITRE ATT&CK mappings are suggestions for defensive prioritization and should be validated by experienced analysts.\n")
+    txt.append("This tool performs non-exploitative reconnaissance and provides defensive findings only. Do NOT run it against systems without explicit written authorization. The MITRE ATT&CK mappings are best-effort suggestions.\n", style="yellow")
     console.print(Panel(txt, title="Operator Disclaimer", border_style="red"))
 
 
@@ -512,6 +678,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--timeout", type=float, default=3.0, help="Network timeout seconds")
     parser.add_argument("--output-json", help="Write results to JSON file")
     parser.add_argument("--help", "-h", action="store_true", help="Show help and exit")
+    # Optional passive intelligence connectors (read-only queries)
+    parser.add_argument("--shodan-key", help="Optional Shodan API key for passive host enrichment (read-only)")
+    parser.add_argument("--censys-key", help="Optional Censys API key for passive host enrichment (read-only)")
+    parser.add_argument("--nvd-api-key", help="Optional NVD API key to increase NVD rate limits for CVE lookups")
 
     args = parser.parse_args(argv)
 
@@ -547,7 +717,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), TimeElapsedColumn(), console=console) as progress:
         task = progress.add_task("Scanning targets...", total=len(targets))
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(targets), max(2, args.threads))) as pool:
-            future_map = {pool.submit(analyze_target, t, args.threads, args.timeout): t for t in targets}
+            future_map = {pool.submit(analyze_target, t, args.threads, args.timeout, args.nvd_api_key, args.shodan_key, args.censys_key): t for t in targets}
             for fut in concurrent.futures.as_completed(future_map):
                 t = future_map[fut]
                 try:
@@ -555,6 +725,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     results.append(res)
                     # Extract findings
                     for fdict in res.get("findings", []):
+                        # tolerate missing newer fields when loading from older JSON
+                        fdict.setdefault("cve_id", None)
+                        fdict.setdefault("cvss", None)
+                        fdict.setdefault("cve_desc", None)
                         f = Finding(**fdict)
                         findings_accum.append((t, f))
                 except Exception as e:
