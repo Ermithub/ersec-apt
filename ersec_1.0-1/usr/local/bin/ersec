@@ -93,53 +93,51 @@ class ErsecEngine:
 
         self.data["ports"] = open_services
 
-    def generate_advanced_simulation_vectors(self):
-        """Generates advanced MITRE-aligned attack vectors if risk score > 4.0 under strict operator responsibility."""
+    def generate_ethical_hacking_vectors(self):
+        """Generates advanced MITRE-aligned adversary simulation vectors if risk score > 4.0."""
         vectors = []
         score = min(self.risk_score, 10.0)
         
         if score >= 4.0:
             vectors.append({
-                "category": "Vector 1: Application & Public-Facing Exploitation",
+                "category": "Vector 1: Application Layer & Vulnerability Probing",
                 "mitre": "MITRE ATT&CK T1190 (Exploit Public-Facing Application)",
-                "action": "Perform controlled vulnerability probing or exploit framework evaluations against identified database/service ports to test authentication robustness and input sanitization."
+                "action": "Conduct authorized vulnerability assessments or protocol fuzzing against exposed service ports to verify input sanitization and patch levels."
             })
             vectors.append({
-                "category": "Vector 2: Volumetric Stress & Service Resilience",
-                "mitre": "MITRE ATT&CK T1498 (Network Denial of Service / Stress Testing)",
-                "action": "Execute authorized high-concurrency request benchmarking or SYN/HTTP flood resilience testing to measure edge rate-limiting thresholds and load balancer degradation points."
+                "category": "Vector 2: Volumetric Load & Denial-of-Service Resilience",
+                "mitre": "MITRE ATT&CK T1498 (Network Denial of Service / Stress Simulation)",
+                "action": "Execute controlled concurrency benchmarking and edge rate-limiting validation tests to measure resilience against volumetric saturation."
             })
             vectors.append({
-                "category": "Vector 3: Credential Access & Brute-Force Simulation",
+                "category": "Vector 3: Credential Access & Brute-Force Testing",
                 "mitre": "MITRE ATT&CK T1110 (Brute Force / Credential Stuffing)",
-                "action": "Simulate automated dictionary attacks against exposed remote administration services (e.g., SSH/RDP/MySQL) to audit lockout policies and password complexity enforcement."
+                "action": "Simulate automated login/dictionary evaluations against active authentication interfaces to verify account lockout enforcement and password complexity."
             })
         return vectors
 
     def query_ai_engine(self):
-        """Robust multi-model fallback API client labeled cleanly as AI."""
+        """Universal AI client with rock-solid model fallback routing."""
         api_key = os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY")
         if not api_key:
-            return "[yellow]API key environment variable not detected. Skipping generative AI threat matrix.[/yellow]"
+            return "[yellow]API key environment variable not detected. Skipping AI executive assessment.[/yellow]"
 
-        # Up-to-date models list with automatic error fallbacks
         candidate_models = [
-            "openai/gpt-oss-120b",
+            "llama-3.1-8b-instant",
             "llama-3.3-70b-versatile",
-            "qwen/qwen3.6-27b",
-            "llama-3.1-8b-instant"
+            "mixtral-8x7b-32768"
         ]
 
         prompt = f"""
         Target Scope: {self.target}
         Calculated Risk Score: {self.risk_score}/10
-        Identified Risk Factors: {json.dumps(self.risk_factors)}
-        Open Ports Found: {json.dumps(self.data.get('ports', []))}
+        Identified Vulnerabilities: {json.dumps(self.risk_factors)}
+        Open Ports Discovered: {json.dumps(self.data.get('ports', []))}
 
         Act as an elite CISO Red Team Analyst. Provide:
-        1. Executive Threat Assessment (2 sentences).
-        2. Primary Exploit Chain Pathway.
-        3. Strategic Remediation Recommendation.
+        1. Concise Executive Threat Summary.
+        2. Primary Adversary Exploit Chain.
+        3. Strategic Hardening Recommendations.
         """
 
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -157,12 +155,12 @@ class ErsecEngine:
             except Exception:
                 continue
 
-        return "[red]All AI endpoints currently unreachable or rate-limited. Proceeding with static analysis engine.[/red]"
+        return "[red]AI endpoints unreachable or rate-limited. Operating on core static telemetry engine.[/red]"
 
     def run_all(self):
         console.print(Panel.fit(
-            f"[bold white style=on red] ERSEC v6.0 — PROFESSIONAL ENTERPRISE SECURITY PLATFORM [/]\n"
-            f"[bold cyan]Target Domain:[/] {self.target}",
+            f"[bold white style=on red] ERSEC v7.0 — PROFESSIONAL ENTERPRISE SECURITY PLATFORM [/]\n"
+            f"[bold cyan]Target Scope:[/] {self.target}",
             border_style="red"
         ))
 
@@ -179,20 +177,20 @@ class ErsecEngine:
         score_color = "red" if final_score >= 4.0 else "green"
         console.print(Panel(f"ATTACK SURFACE RISK SCORE: {final_score} / 10.0", border_style=score_color))
 
-        # Ethical Red-Team Module (Triggered if score >= 4.0)
+        # Conditional Ethical Hacking / Adversary Simulation Vectors (Triggered if score >= 4.0)
         if final_score >= 4.0:
-            vectors = self.generate_advanced_simulation_vectors()
-            table_vec = Table(title="[bold red]Authorized Adversary Simulation Vectors (MITRE ATT&CK Aligned)[/bold red]", expand=True)
-            table_vec.add_column("Simulation Category", style="cyan", width=25)
-            table_vec.add_column("MITRE Mapping", style="yellow", width=25)
-            table_vec.add_column("Operator Action Specification", style="white")
+            vectors = self.generate_ethical_hacking_vectors()
+            table_vec = Table(title="[bold red]Authorized Ethical Hacking & Adversary Simulation Vectors (MITRE Aligned)[/bold red]", expand=True)
+            table_vec.add_column("Simulation Vector", style="cyan", width=25)
+            table_vec.add_column("MITRE Framework", style="yellow", width=25)
+            table_vec.add_column("Authorized Operator Actions", style="white")
 
             for v in vectors:
                 table_vec.add_row(v["category"], v["mitre"], v["action"])
             console.print(table_vec)
-            console.print("[bold yellow]DISCLAIMER:[/bold yellow] [dim]Execution of these simulation vectors is restricted exclusively to authorized systems under explicit written consent. 100% legal and operational liability rests solely upon the system operator.[/dim]\n")
+            console.print("[bold yellow]LEGAL DISCLAIMER:[/bold yellow] [dim]These simulation pathways are provided strictly for authorized penetration testing and defensive posture validation under explicit written authorization. 100% legal and operational accountability rests exclusively upon the system operator.[/dim]\n")
 
-        # Clean AI Intelligence Output
+        # Professional AI Intelligence Output
         ai_output = self.query_ai_engine()
         console.print(Panel(ai_output, title="[bold cyan]AI Executive Threat Intelligence Analysis[/bold cyan]", border_style="cyan"))
 
