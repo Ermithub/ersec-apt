@@ -3,7 +3,6 @@ import concurrent.futures
 import json
 import os
 import socket
-import ssl
 import sys
 import requests
 from rich.console import Console
@@ -40,47 +39,42 @@ class ErsecEngine:
         except Exception:
             self.data["geoip"] = None
 
-    def fetch_rdap_whois(self):
-        try:
-            res = requests.get(f"https://rdap.org/domain/{self.target}", timeout=6).json()
-            events = {e.get("eventAction"): e.get("eventDate", "N/A")[:10] for e in res.get("events", [])}
-            self.data["rdap"] = {
-                "registrar": res.get("port43", "N/A"),
-                "created": events.get("registration", "N/A"),
-                "expiration": events.get("expiration", "N/A"),
-            }
-        except Exception:
-            self.data["rdap"] = None
-
     def audit_http_headers(self):
         headers_info = {"present": {}, "missing": []}
         try:
             res = requests.get(f"http://{self.target}", timeout=6, allow_redirects=True)
             headers = res.headers
-
             sec_headers = {
                 "Strict-Transport-Security": "HSTS Enforced",
                 "Content-Security-Policy": "CSP Configured",
                 "X-Frame-Options": "Clickjacking Protection",
                 "X-Content-Type-Options": "MIME Sniffing Protection"
             }
-
             for header, label in sec_headers.items():
                 if header in headers:
                     headers_info["present"][label] = headers[header][:30]
                 else:
                     headers_info["missing"].append(label)
-                    self.risk_score += 0.5
+                    self.risk_score += 0.6
                     self.risk_factors.append(f"Missing Header: {header}")
-
             self.data["http"] = headers_info
         except Exception:
+            self.data["http"] = None
+
+    def scan_ports(self):
+        critical_ports = {
+            21: "FTP", 22: "SSH", 80: "HTTP", 443: "HTTPS", 
+            3306: "MySQL", 3389: "RDP", 6379: "Redis", 8080: "HTTP-Alt"
+        }
         open_services = []
 
         def probe(port, name):
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(1.0)
+                if sock.connect_ex((self.ip, port)) == 0:
+                    sock.close()
+                    return {"port": port, "service": name}
                 sock.close()
             except Exception:
                 pass
@@ -92,13 +86,41 @@ class ErsecEngine:
                 res = f.result()
                 if res:
                     open_services.append(res)
-                    if res["port"] in [21, 3306, 3389]:
-                        self.risk_score += 2.0
-                        self.risk_factors.append(f"Exposed Risky Service: {res['service']} ({res['port']})")
+                    if res["port"] in [21, 3306, 3389, 6379]:
+                        self.risk_score += 2.5
+                        self.risk_factors.append(f"High-Risk Exposed Port/Service: {res['service']} ({res['port']})")
+                    else:
+                        self.risk_score += 0.5
 
         self.data["ports"] = open_services
 
+    def generate_mitre_and_attack_vectors(self):
+        """Generates MITRE ATT&CK mapping and simulated red-team operational vectors if score > 4.0."""
+        vectors = []
+        score = min(self.risk_score, 10.0)
+        
+        if score >= 4.0:
+            vectors.append({
+                "category": "Vector 1: External Remote Services & Initial Access",
+                "mitre": "MITRE ATT&CK T1190 (Exploit Public-Facing Application) / T1078 (Valid Accounts)",
+                "simulation": "If database or remote management ports (e.g., MySQL/RDP) are exposed, simulate credential stuffing or brute-force tests via authorized tooling (e.g., Hydra/Nmap NSE scripts) to test password complexity and account lockout policies."
+            })
+            vectors.append({
+                "category": "Vector 2: Application Layer & Client-Side Interception",
+                "mitre": "MITRE ATT&CK T1557 (Adversary-in-the-Middle) / T1040 (Network Sniffing)",
+                "simulation": "Due to missing security headers (HSTS/CSP), evaluate HTTP traffic interception or session hijacking resilience using proxy tools under an approved scope agreement."
+            })
+            vectors.append({
+                "category": "Vector 3: Infrastructure Stress & Volumetric Resilience",
+                "mitre": "MITRE ATT&CK T1498 (Network Denial of Service)",
+                "simulation": "Test edge firewall rate-limiting and SYN-flood protection tolerances by conducting controlled, authorized load evaluations (e.g., using distributed benchmarking or compliance verification utilities)."
+            })
+        return vectors
+
     def query_groq_executive_ai(self):
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            return "[yellow]GROQ_API_KEY not found. Skipping generative AI threat matrix.[/yellow]"
 
         models_to_try = [
             "llama-3.3-70b-versatile",
@@ -109,19 +131,15 @@ class ErsecEngine:
 
         prompt = f"""
         Target: {self.target}
-        Risk Score: {self.risk_score}/10
-        Identified Vulnerabilities: {json.dumps(self.risk_factors)}
+        Calculated Risk Score: {self.risk_score}/10
+        Risk Factors: {json.dumps(self.risk_factors)}
         Open Ports: {json.dumps(self.data.get('ports', []))}
 
-        As a CISO Threat Analyst, provide:
-        1. Executive Threat Summary (2 sentences max).
-        2. Top 2 Attack Vectors an adversary would exploit.
-        3. Immediate Remediation Priority.
-        Keep output concise and impact-focused.
+        Act as an elite Red Team CISO. Provide:
+        1. Concise Attack Surface Assessment.
         """
 
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
         for model in models_to_try:
             try:
                 res = requests.post(
@@ -131,48 +149,52 @@ class ErsecEngine:
                     timeout=8
                 )
                 if res.status_code == 200:
-                    return f"[bold green]Model Used: {model}[/bold green]\n\n" + res.json()['choices'][0]['message']['content']
+                    return f"[bold green]AI Engine Active ({model})[/bold green]\n\n" + res.json()['choices'][0]['message']['content']
             except Exception:
                 continue
-
-        return "[red]Failed to reach Groq API across all candidate models.[/red]"
+        return "[red]Groq models unreachable or rate-limited.[/red]"
 
     def run_all(self):
         console.print(Panel.fit(
-            f"[bold white style=on red] ERSEC v4.0 — REVOLUTIONARY AI OSINT & THREAT ENGINE [/]\n"
-            f"[bold cyan]Target:[/] {self.target}",
+            f"[bold white style=on red] ERSEC v5.0 — PROFESSIONAL RED TEAM & THREAT PLATFORM [/]\n"
+            f"[bold cyan]Target Scope:[/] {self.target}",
             border_style="red"
         ))
 
         self.resolve_dns()
 
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
-            progress.add_task(description="Running Threat Intelligence Sweep...", total=None)
+            progress.add_task(description="Executing Advanced Reconnaissance & Telemetry...", total=None)
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 executor.submit(self.fetch_geoip)
-                executor.submit(self.fetch_rdap_whois)
                 executor.submit(self.audit_http_headers)
                 executor.submit(self.scan_ports)
 
-        score = min(self.risk_score, 10.0)
-        console.print(Panel(f"THREAT SCORE: {score}/10.0", border_style="red" if score > 4 else "green"))
 
-        ai_summary = self.query_groq_executive_ai()
-        console.print(Panel(ai_summary, title="[bold cyan]Groq AI Executive Threat Analysis[/bold cyan]", border_style="cyan"))
+        final_score = round(min(self.risk_score, 10.0), 1)
+        score_color = "red" if final_score >= 4.0 else "green"
+        console.print(Panel(f"ATTACK SURFACE RISK SCORE: {final_score} / 10.0", border_style=score_color))
+
+        # Conditional Ethical Red-Team Assessment Vectors (Triggered if score >= 4.0)
+        if final_score >= 4.0:
+            vectors = self.generate_mitre_and_attack_vectors()
+            table_vec = Table(title="[bold red]Authorized Red-Team Simulation Vectors (MITRE ATT&CK Aligned)[/bold red]", expand=True)
+            table_vec.add_column("Vector / Focus Area", style="cyan", width=25)
+            table_vec.add_column("MITRE Mapping", style="yellow", width=25)
+            table_vec.add_column("Controlled Assessment Procedure (Operator Discretion)", style="white")
+
+            for v in vectors:
+                table_vec.add_row(v["category"], v["mitre"], v["simulation"])
+            console.print(table_vec)
+            console.print("[dim]Notice: These pathways are provided exclusively for authorized penetration testing and defensive validation under explicit user responsibility.[/dim]\n")
+
+        # Groq AI Intelligence
+        ai_output = self.query_groq_executive_ai()
+        console.print(Panel(ai_output, title="[bold cyan]Groq CISO Threat Intelligence[/bold cyan]", border_style="cyan"))
 
 if __name__ == "__main__":
     if len(sys.argv) < 3 or sys.argv[1] != "scan":
-        console.print("[bold red]Usage:[/bold red] ersec scan <domain.com>")
+        console.print("[bold red]Usage Error:[/bold red] ersec scan <domain.com>")
         sys.exit(1)
-
     engine = ErsecEngine(sys.argv[2])
-    engine.run_all()        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            return "[yellow]GROQ_API_KEY environment variable not set. Skipping AI synthesis.[/yellow]"
-                if sock.connect_ex((self.ip, port)) == 0:
-                    sock.close()
-                    return {"port": port, "service": name}
-            self.data["http"] = None
-    def scan_ports(self):
-        critical_ports = {21: "FTP", 22: "SSH", 80: "HTTP", 443: "HTTPS", 3306: "MySQL", 3389: "RDP", 8080: "HTTP-Alt"}
-
+    engine.run_all()

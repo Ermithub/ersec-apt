@@ -4,10 +4,10 @@ Architecture: all
 Maintainer: Developer <dev@ersec.local>
 Depends: python3, python3-requests, python3-rich
 Filename: ./ersec_1.0-1.deb
-Size: 3368
-MD5sum: 57ada17a4a2579e5d871b939e1adc417
-SHA1: ba81751ba078aa4de5e1c4ecc21ceb6e3dedaca6
-SHA256: 07f19916e95b51d2d834a04893145448193c6022cfac5c887a268de12f1b0224
+Size: 4160
+MD5sum: 637c781bf8f8845a3c1eb6c039c36057
+SHA1: 48b01d618c73d19d357adbe6e7018804aafb181e
+SHA256: ce5c1e8f720e3683e7a9bd95cd9cec0a8cbd894834b70703057bd07dc36a7efb
 Section: utils
 Priority: optional
 Description: Zero-Key OSINT and Recon Scanner
